@@ -33,6 +33,7 @@ impl Element {
 pub enum DrawMode {
     Line,
     Resistor,
+    Move,
     Erase,
 }
 
@@ -43,7 +44,7 @@ pub struct DraggedEndpoint {
 }
 
 // Handles are drawn at this radius; their larger hit area makes them easier to grab.
-pub const ENDPOINT_RADIUS: f32 = 6.0;
+pub const ENDPOINT_RADIUS: f32 = 8.0;
 // Endpoints within this distance are joined to make circuit connections easy to align.
 const SNAP_DISTANCE: f32 = 12.0;
 const ERASE_DISTANCE: f32 = 10.0;
@@ -71,12 +72,37 @@ pub fn endpoint_at(elements: &[Element], position: egui::Pos2) -> Option<Dragged
     None
 }
 
+// Returns every endpoint at the selected endpoint's position so joined elements move together.
+pub fn overlapping_endpoints(
+    elements: &[Element],
+    selected: DraggedEndpoint,
+) -> Vec<DraggedEndpoint> {
+    let (start, end) = elements[selected.element_index].endpoints();
+    let selected_position = if selected.is_start { start } else { end };
+
+    elements
+        .iter()
+        .enumerate()
+        .flat_map(|(element_index, element)| {
+            let (start, end) = element.endpoints();
+            [(true, start), (false, end)]
+                .into_iter()
+                .filter_map(move |(is_start, endpoint)| {
+                    (endpoint == selected_position).then_some(DraggedEndpoint {
+                        element_index,
+                        is_start,
+                    })
+                })
+        })
+        .collect()
+}
+
 // Returns the closest existing endpoint inside the snap radius, or the original position.
-// `ignored_endpoint` prevents a dragged handle from snapping to its own old position.
+// `ignored_endpoints` prevents dragged handles from snapping to their old positions.
 pub fn snap_to_endpoint(
     elements: &[Element],
     position: egui::Pos2,
-    ignored_endpoint: Option<DraggedEndpoint>,
+    ignored_endpoints: &[DraggedEndpoint],
 ) -> egui::Pos2 {
     let mut closest = None;
 
@@ -84,7 +110,7 @@ pub fn snap_to_endpoint(
         let (start, end) = element.endpoints();
 
         for (is_start, endpoint) in [(true, start), (false, end)] {
-            if ignored_endpoint.is_some_and(|ignored| {
+            if ignored_endpoints.iter().any(|ignored| {
                 ignored.element_index == element_index && ignored.is_start == is_start
             }) {
                 continue;

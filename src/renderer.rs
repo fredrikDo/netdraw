@@ -2,6 +2,11 @@ use eframe::egui;
 
 use crate::element::{Element, ENDPOINT_RADIUS};
 
+// Endpoint handles appear only when the pointer is close enough to interact with them.
+const HANDLE_HOVER_DISTANCE: f32 = 24.0;
+const JUNCTION_NODE_RADIUS: f32 = 3.0;
+const RESISTOR_TERMINAL_LENGTH: f32 = 16.0;
+
 pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
     for element in elements {
         draw_element(painter, *element);
@@ -17,18 +22,97 @@ pub fn draw_element(painter: &egui::Painter, element: Element) {
     }
 }
 
-// Draw small handles to show the points that can be moved.
-pub fn draw_endpoint_handles(painter: &egui::Painter, elements: &[Element]) {
+// Draw small handles only for endpoints near the pointer.
+pub fn draw_endpoint_handles(
+    painter: &egui::Painter,
+    elements: &[Element],
+    pointer_position: Option<egui::Pos2>,
+) {
     for element in elements {
         let (start, end) = element.endpoints();
 
         for point in [start, end] {
-            painter.circle_filled(point, ENDPOINT_RADIUS, egui::Color32::WHITE);
+            if !pointer_position.is_some_and(|pointer| {
+                pointer.distance(point) <= HANDLE_HOVER_DISTANCE
+            }) {
+                continue;
+            }
+
+            // Decide later whether the handle should be filled or not!
+            // painter.circle_filled(point, ENDPOINT_RADIUS, egui::Color32::WHITE);
             painter.circle_stroke(
                 point,
                 ENDPOINT_RADIUS,
-                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                egui::Stroke::new(1.0, egui::Color32::PURPLE),
             );
+        }
+    }
+}
+
+// Draw a junction node wherever two or more resistor endpoints share a position.
+pub fn draw_resistor_junction_nodes(painter: &egui::Painter, elements: &[Element]) {
+    let mut endpoint_groups: Vec<(egui::Pos2, usize)> = Vec::new();
+
+    for element in elements {
+        if let Element::Resistor(start, end) = element {
+            for position in [*start, *end] {
+                if let Some((_, count)) = endpoint_groups
+                    .iter_mut()
+                    .find(|(group_position, _)| *group_position == position)
+                {
+                    *count += 1;
+                } else {
+                    endpoint_groups.push((position, 1));
+                }
+            }
+        }
+    }
+
+    for (position, count) in endpoint_groups {
+        if count >= 2 {
+            painter.circle_filled(position, JUNCTION_NODE_RADIUS, egui::Color32::BLACK);
+        }
+    }
+}
+
+// Mark resistor endpoints that are not connected to another element with a terminal tick.
+pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[Element]) {
+    let all_endpoints: Vec<_> = elements
+        .iter()
+        .flat_map(|element| {
+            let (start, end) = element.endpoints();
+            [start, end]
+        })
+        .collect();
+
+    for element in elements {
+        let Element::Resistor(start, end) = element else {
+            continue;
+        };
+
+        let direction = *end - *start;
+        let length = direction.length();
+        if length == 0.0 {
+            continue;
+        }
+
+        let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
+        let half_length = RESISTOR_TERMINAL_LENGTH / 2.0;
+
+        for position in [*start, *end] {
+            let connection_count = all_endpoints
+                .iter()
+                .filter(|other| **other == position)
+                .count();
+            if connection_count == 1 {
+                painter.line_segment(
+                    [
+                        position - perpendicular * half_length,
+                        position + perpendicular * half_length,
+                    ],
+                    egui::Stroke::new(2.0, egui::Color32::BLACK),
+                );
+            }
         }
     }
 }
