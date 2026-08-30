@@ -5,25 +5,43 @@ use eframe::egui;
 pub enum Element {
     Line(egui::Pos2, egui::Pos2),
     Resistor(egui::Pos2, egui::Pos2),
+    PrescribedFlow(egui::Pos2, egui::Pos2),
 }
 
 impl Element {
     pub fn endpoints(&self) -> (egui::Pos2, egui::Pos2) {
         match self {
-            Self::Line(start, end) | Self::Resistor(start, end) => (*start, *end),
+            Self::Line(start, end)
+            | Self::Resistor(start, end)
+            | Self::PrescribedFlow(start, end) => (*start, *end),
         }
     }
 
     pub fn move_endpoint(&mut self, is_start: bool, position: egui::Pos2) {
-        // Lines and resistors share the same two-point geometry.
+        // Two-terminal elements share the same editable geometry.
         match self {
-            Self::Line(start, end) | Self::Resistor(start, end) => {
+            Self::Line(start, end)
+            | Self::Resistor(start, end)
+            | Self::PrescribedFlow(start, end) => {
                 if is_start {
                     *start = position;
                 } else {
                     *end = position;
                 }
             }
+        }
+    }
+
+    // A prescribed-flow arrow only connects at its tip (the end endpoint).
+    pub fn endpoint_can_snap(&self, is_start: bool) -> bool {
+        !matches!(self, Self::PrescribedFlow(_, _) if is_start)
+    }
+
+    pub fn translated(self, offset: egui::Vec2) -> Self {
+        match self {
+            Self::Line(start, end) => Self::Line(start + offset, end + offset),
+            Self::Resistor(start, end) => Self::Resistor(start + offset, end + offset),
+            Self::PrescribedFlow(start, end) => Self::PrescribedFlow(start + offset, end + offset),
         }
     }
 }
@@ -33,6 +51,7 @@ impl Element {
 pub enum DrawMode {
     Line,
     Resistor,
+    PrescribedFlow,
     Move,
     Erase,
 }
@@ -110,6 +129,10 @@ pub fn snap_to_endpoint(
         let (start, end) = element.endpoints();
 
         for (is_start, endpoint) in [(true, start), (false, end)] {
+            if !element.endpoint_can_snap(is_start) {
+                continue;
+            }
+
             if ignored_endpoints.iter().any(|ignored| {
                 ignored.element_index == element_index && ignored.is_start == is_start
             }) {

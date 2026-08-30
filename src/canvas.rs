@@ -6,10 +6,13 @@ use crate::{
         DrawMode, Element,
     },
     renderer::{
-        draw_element, draw_elements, draw_endpoint_handles, draw_resistor_junction_nodes,
-        draw_unconnected_resistor_terminals,
+        draw_element, draw_elements, draw_endpoint_handles, draw_prescribed_flow_junction_nodes,
+        draw_resistor_junction_nodes, draw_unconnected_resistor_terminals,
     },
+    exporter,
 };
+
+const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -22,11 +25,14 @@ pub fn run() -> eframe::Result<()> {
 
 struct Canvas {
     elements: Vec<Element>,
-    // Set only while a new line or resistor is being drawn.
+    // Set only while a new element is being drawn.
     start: Option<egui::Pos2>,
     // Set while moving one or more connected endpoints of completed elements.
     dragged_endpoints: Vec<DraggedEndpoint>,
     draw_mode: DrawMode,
+    export_dialog_open: bool,
+    export_path: String,
+    export_status: Option<String>,
 }
 
 impl Default for Canvas {
@@ -36,27 +42,119 @@ impl Default for Canvas {
             start: None,
             dragged_endpoints: Vec::new(),
             draw_mode: DrawMode::Line,
+            export_dialog_open: false,
+            export_path: String::from("canvas.svg"),
+            export_status: None,
         }
     }
 }
 
 impl Canvas {
     fn show(&mut self, ui: &mut egui::Ui) {
+        self.show_menu_bar(ui);
         self.show_toolbar(ui);
+        self.show_export_dialog(ui.ctx());
 
-        let (response, painter) =
-            ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.show_canvas(ui));
+    }
+
+    fn show_canvas(&mut self, ui: &mut egui::Ui) {
+        let (response, painter) = ui.allocate_painter(CANVAS_SIZE, egui::Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, egui::Color32::WHITE);
+        let origin = response.rect.min.to_vec2();
+        let pointer_position = response
+            .interact_pointer_pos()
+            .map(|position| position - origin);
 
-        self.handle_erase(&response);
-        self.handle_drag(&response);
+        self.handle_erase(&response, pointer_position);
+        self.handle_drag(&response, pointer_position);
 
-        draw_elements(&painter, &self.elements);
-        draw_unconnected_resistor_terminals(&painter, &self.elements);
-        draw_endpoint_handles(&painter, &self.elements, response.hover_pos());
-        draw_resistor_junction_nodes(&painter, &self.elements);
-        self.draw_preview(&painter, &response);
-        self.finish_drag(&response);
+        // Geometry is stored relative to the scrollable canvas but rendered in screen space.
+        let screen_elements: Vec<_> = self
+            .elements
+            .iter()
+            .map(|element| element.translated(origin))
+            .collect();
+        draw_elements(&painter, &screen_elements);
+        draw_unconnected_resistor_terminals(&painter, &screen_elements);
+        draw_endpoint_handles(&painter, &screen_elements, response.hover_pos());
+        draw_resistor_junction_nodes(&painter, &screen_elements);
+        draw_prescribed_flow_junction_nodes(&painter, &screen_elements);
+        self.draw_preview(&painter, pointer_position, origin);
+        self.finish_drag(&response, pointer_position);
+    }
+
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Export…").clicked() {
+                    self.export_dialog_open = true;
+                    self.export_status = None;
+                    ui.close();
+                }
+                if ui.button("Quit").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                ui.label("Edit actions will appear here.");
+            });
+            ui.menu_button("Help", |ui| {
+                ui.label("Help information will appear here.");
+            });
+        });
+    }
+
+    fn show_export_dialog(&mut self, ctx: &egui::Context) {
+        if !self.export_dialog_open {
+            return;
+        }
+
+        let mut close_dialog = false;
+        egui::Window::new("Export SVG")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Save canvas as:");
+                ui.text_edit_singleline(&mut self.export_path);
+
+                if let Some(status) = &self.export_status {
+                    ui.label(status);
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        let path = self.export_path.trim();
+                        if path.is_empty() {
+                            self.export_status = Some(String::from("Enter a file name."));
+                        } else {
+                            let path = if path.ends_with(".svg") {
+                                path.to_owned()
+                            } else {
+                                format!("{path}.svg")
+                            };
+                            match std::fs::write(&path, exporter::svg(&self.elements)) {
+                                Ok(()) => {
+                                    self.export_status = Some(format!("Saved {path}"));
+                                    close_dialog = true;
+                                }
+                                Err(error) => {
+                                    self.export_status = Some(format!("Could not save SVG: {error}"));
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close_dialog = true;
+                    }
+                });
+            });
+
+        if close_dialog {
+            self.export_dialog_open = false;
+        }
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -64,6 +162,7 @@ impl Canvas {
             ui.label("Draw:");
             self.select_mode(ui, DrawMode::Line, "Line");
             self.select_mode(ui, DrawMode::Resistor, "Resistance");
+            self.select_mode(ui, DrawMode::PrescribedFlow, "Prescribed flow");
             ui.separator();
             self.select_mode(ui, DrawMode::Move, "Move");
             ui.separator();
@@ -84,10 +183,10 @@ impl Canvas {
         }
     }
 
-    fn handle_erase(&mut self, response: &egui::Response) {
+    fn handle_erase(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         // In erase mode, remove the topmost element under a canvas click.
         if self.draw_mode == DrawMode::Erase && response.clicked() {
-            if let Some(position) = response.interact_pointer_pos() {
+            if let Some(position) = pointer_position {
                 if let Some(element_index) = element_at(&self.elements, position) {
                     self.elements.remove(element_index);
                 }
@@ -95,9 +194,9 @@ impl Canvas {
         }
     }
 
-    fn handle_drag(&mut self, response: &egui::Response) {
+    fn handle_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         if response.drag_started() {
-            if let Some(position) = response.interact_pointer_pos() {
+            if let Some(position) = pointer_position {
                 match self.draw_mode {
                     DrawMode::Move => {
                         self.dragged_endpoints = endpoint_at(&self.elements, position)
@@ -107,17 +206,23 @@ impl Canvas {
                     DrawMode::Line | DrawMode::Resistor => {
                         self.start = Some(snap_to_endpoint(&self.elements, position, &[]));
                     }
+                    // The arrow starts at its tail, which is intentionally not a snapping end.
+                    DrawMode::PrescribedFlow => self.start = Some(position),
                     DrawMode::Erase => {}
                 }
             }
         }
 
-        if let Some(position) = response.interact_pointer_pos()
+        if let Some(position) = pointer_position
             && !self.dragged_endpoints.is_empty()
         {
             // Update on every frame while the pointer is held down for smooth motion.
-            let snapped_position =
-                snap_to_endpoint(&self.elements, position, &self.dragged_endpoints);
+            let can_snap = self.dragged_endpoints.iter().all(|endpoint| {
+                self.elements[endpoint.element_index].endpoint_can_snap(endpoint.is_start)
+            });
+            let snapped_position = can_snap
+                .then(|| snap_to_endpoint(&self.elements, position, &self.dragged_endpoints))
+                .unwrap_or(position);
             for endpoint in &self.dragged_endpoints {
                 self.elements[endpoint.element_index]
                     .move_endpoint(endpoint.is_start, snapped_position);
@@ -125,18 +230,28 @@ impl Canvas {
         }
     }
 
-    fn draw_preview(&self, painter: &egui::Painter, response: &egui::Response) {
-        if let (Some(start), Some(position)) = (self.start, response.interact_pointer_pos()) {
+    fn draw_preview(
+        &self,
+        painter: &egui::Painter,
+        pointer_position: Option<egui::Pos2>,
+        origin: egui::Vec2,
+    ) {
+        if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = snap_to_endpoint(&self.elements, position, &[]);
             match self.draw_mode {
-                DrawMode::Line => draw_element(painter, Element::Line(start, end)),
-                DrawMode::Resistor => draw_element(painter, Element::Resistor(start, end)),
+                DrawMode::Line => draw_element(painter, Element::Line(start, end).translated(origin)),
+                DrawMode::Resistor => {
+                    draw_element(painter, Element::Resistor(start, end).translated(origin))
+                }
+                DrawMode::PrescribedFlow => {
+                    draw_element(painter, Element::PrescribedFlow(start, end).translated(origin))
+                }
                 DrawMode::Move | DrawMode::Erase => {}
             }
         }
     }
 
-    fn finish_drag(&mut self, response: &egui::Response) {
+    fn finish_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         if !response.drag_stopped() {
             return;
         }
@@ -146,11 +261,14 @@ impl Canvas {
             return;
         }
 
-        if let (Some(start), Some(position)) = (self.start, response.interact_pointer_pos()) {
+        if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = snap_to_endpoint(&self.elements, position, &[]);
             match self.draw_mode {
                 DrawMode::Line => self.elements.push(Element::Line(start, end)),
                 DrawMode::Resistor => self.elements.push(Element::Resistor(start, end)),
+                DrawMode::PrescribedFlow => {
+                    self.elements.push(Element::PrescribedFlow(start, end))
+                }
                 DrawMode::Move | DrawMode::Erase => {}
             }
         }

@@ -6,6 +6,7 @@ use crate::element::{Element, ENDPOINT_RADIUS};
 const HANDLE_HOVER_DISTANCE: f32 = 24.0;
 const JUNCTION_NODE_RADIUS: f32 = 3.0;
 const RESISTOR_TERMINAL_LENGTH: f32 = 16.0;
+const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 
 pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
     for element in elements {
@@ -16,9 +17,10 @@ pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
 pub fn draw_element(painter: &egui::Painter, element: Element) {
     match element {
         Element::Line(start, end) => {
-            painter.line_segment([start, end], egui::Stroke::new(1.0, egui::Color32::BLACK));
+            painter.line_segment([start, end], egui::Stroke::new(1.5, egui::Color32::BLACK));
         }
         Element::Resistor(start, end) => draw_resistor(painter, start, end),
+        Element::PrescribedFlow(start, end) => draw_prescribed_flow(painter, start, end),
     }
 }
 
@@ -75,6 +77,15 @@ pub fn draw_resistor_junction_nodes(painter: &egui::Painter, elements: &[Element
     }
 }
 
+// The arrow tip is the prescribed-flow symbol's only connectable endpoint.
+pub fn draw_prescribed_flow_junction_nodes(painter: &egui::Painter, elements: &[Element]) {
+    for element in elements {
+        if let Element::PrescribedFlow(_, end) = element {
+            painter.circle_filled(*end, JUNCTION_NODE_RADIUS, egui::Color32::BLACK);
+        }
+    }
+}
+
 // Mark resistor endpoints that are not connected to another element with a terminal tick.
 pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[Element]) {
     let all_endpoints: Vec<_> = elements
@@ -110,7 +121,7 @@ pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[
                         position - perpendicular * half_length,
                         position + perpendicular * half_length,
                     ],
-                    egui::Stroke::new(2.0, egui::Color32::BLACK),
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
                 );
             }
         }
@@ -151,4 +162,43 @@ pub fn draw_resistor(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2
     for pair in points.windows(2) {
         painter.line_segment([pair[0], pair[1]], stroke);
     }
+}
+
+// Draw an IEEE-style independent current source: lead wires, a centered circle, and an arrow.
+fn draw_prescribed_flow(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
+    let stroke = egui::Stroke::new(1.5, egui::Color32::BLACK);
+    let offset = end - start;
+    let length = offset.length();
+
+    if length == 0.0 {
+        return;
+    }
+
+    let direction = offset / length;
+    let center = start + offset * 0.5;
+    let radius = PRESCRIBED_FLOW_RADIUS.min((length / 2.0).max(0.0));
+    let circle_start = center - direction * radius;
+    let circle_end = center + direction * radius;
+
+    painter.line_segment([start, circle_start], stroke);
+    painter.line_segment([circle_end, end], stroke);
+    painter.circle_filled(center, radius, egui::Color32::WHITE);
+    painter.circle_stroke(center, radius, stroke);
+
+    let arrow_start = center - direction * (radius * 0.55);
+    let arrow_tip = center + direction * (radius * 0.55);
+    let perpendicular = egui::Vec2::new(-direction.y, direction.x);
+    let arrowhead_length = radius * 0.4;
+    let arrowhead_width = radius * 0.3;
+    let arrowhead_base = arrow_tip - direction * arrowhead_length;
+
+    painter.line_segment([arrow_start, arrow_tip], stroke);
+    painter.line_segment(
+        [arrow_tip, arrowhead_base + perpendicular * arrowhead_width],
+        stroke,
+    );
+    painter.line_segment(
+        [arrow_tip, arrowhead_base - perpendicular * arrowhead_width],
+        stroke,
+    );
 }
