@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::path::Path;
 
 use crate::{
     element::{
@@ -118,7 +119,15 @@ impl Canvas {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label("Save canvas as:");
-                ui.text_edit_singleline(&mut self.export_path);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.export_path);
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = Self::choose_export_path(&self.export_path) {
+                            self.export_path = path;
+                            self.export_status = None;
+                        }
+                    }
+                });
 
                 if let Some(status) = &self.export_status {
                     ui.label(status);
@@ -155,6 +164,25 @@ impl Canvas {
         if close_dialog {
             self.export_dialog_open = false;
         }
+    }
+
+    fn choose_export_path(current_path: &str) -> Option<String> {
+        let path = Path::new(current_path);
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("SVG image", &["svg"])
+            .set_file_name(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("canvas.svg"),
+            );
+
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            dialog = dialog.set_directory(parent);
+        }
+
+        dialog
+            .save_file()
+            .map(|path| path.to_string_lossy().into_owned())
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
