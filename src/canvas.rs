@@ -223,6 +223,22 @@ impl Canvas {
     }
 
     fn handle_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
+        // This must use the press state rather than `drag_started()`: because the canvas also
+        // accepts clicks, egui delays `drag_started()` until the pointer moves past the click
+        // threshold. Record the start point on the initial press instead.
+        if response.is_pointer_button_down_on() && self.start.is_none() {
+            if let Some(position) = pointer_position {
+                match self.draw_mode {
+                    DrawMode::Line | DrawMode::Resistor => {
+                        self.start = Some(snap_to_endpoint(&self.elements, position, &[]));
+                    }
+                    // The arrow starts at its tail, which is intentionally not a snapping end.
+                    DrawMode::PrescribedFlow => self.start = Some(position),
+                    DrawMode::Move | DrawMode::Erase => {}
+                }
+            }
+        }
+
         if response.drag_started() {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
@@ -231,12 +247,10 @@ impl Canvas {
                             .map(|endpoint| overlapping_endpoints(&self.elements, endpoint))
                             .unwrap_or_default();
                     }
-                    DrawMode::Line | DrawMode::Resistor => {
-                        self.start = Some(snap_to_endpoint(&self.elements, position, &[]));
-                    }
-                    // The arrow starts at its tail, which is intentionally not a snapping end.
-                    DrawMode::PrescribedFlow => self.start = Some(position),
-                    DrawMode::Erase => {}
+                    DrawMode::Line
+                    | DrawMode::Resistor
+                    | DrawMode::PrescribedFlow
+                    | DrawMode::Erase => {}
                 }
             }
         }
