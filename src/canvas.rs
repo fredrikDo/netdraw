@@ -3,12 +3,13 @@ use std::path::Path;
 
 use crate::{
     element::{
-        element_at, endpoint_at, overlapping_endpoints, snap_to_endpoint, DraggedEndpoint,
-        DrawMode, Element,
+        element_at, endpoint_at, junction_positions, overlapping_endpoints, snap_to_endpoint,
+        unconnected_resistor_terminal_positions, DraggedEndpoint, DrawMode, Element,
     },
     renderer::{
-        draw_element, draw_elements, draw_endpoint_handles, draw_prescribed_flow_junction_nodes,
-        draw_resistor_junction_nodes, draw_unconnected_resistor_terminals,
+        draw_element, draw_elements, draw_endpoint_handles, draw_labels,
+        draw_prescribed_flow_junction_nodes, draw_resistor_junction_nodes,
+        draw_unconnected_resistor_terminals,
     },
     exporter,
 };
@@ -26,6 +27,9 @@ pub fn run() -> eframe::Result<()> {
 
 struct Canvas {
     elements: Vec<Element>,
+    labels: Vec<String>,
+    node_labels: Vec<crate::label::NodeLabel>,
+    terminal_labels: Vec<crate::label::NodeLabel>,
     // Set only while a new element is being drawn.
     start: Option<egui::Pos2>,
     // Set while moving one or more connected endpoints of completed elements.
@@ -34,18 +38,30 @@ struct Canvas {
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
+    editing_label: Option<EditingLabel>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EditingLabel {
+    Element(usize),
+    Node(usize),
+    Terminal(usize),
 }
 
 impl Default for Canvas {
     fn default() -> Self {
         Self {
             elements: Vec::new(),
+            labels: Vec::new(),
+            node_labels: Vec::new(),
+            terminal_labels: Vec::new(),
             start: None,
             dragged_endpoints: Vec::new(),
             draw_mode: DrawMode::Line,
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
             export_status: None,
+            editing_label: None,
         }
     }
 }
@@ -70,6 +86,7 @@ impl Canvas {
             .map(|position| position - origin);
 
         self.handle_erase(&response, pointer_position);
+        self.handle_label_click(&response, pointer_position);
         self.handle_drag(&response, pointer_position);
 
         // Geometry is stored relative to the scrollable canvas but rendered in screen space.
@@ -83,8 +100,101 @@ impl Canvas {
         draw_endpoint_handles(&painter, &screen_elements, response.hover_pos());
         draw_resistor_junction_nodes(&painter, &screen_elements);
         draw_prescribed_flow_junction_nodes(&painter, &screen_elements);
+        // An empty label still needs a temporary location while its editor is open.
+        let mut layout_labels = self.labels.clone();
+        if let Some(EditingLabel::Element(index)) = self.editing_label
+            && layout_labels.get(index).is_some_and(String::is_empty)
+        {
+            layout_labels[index] = String::from(" ");
+        }
+        let label_placements = crate::label::placements(&self.elements, &layout_labels);
+        let mut layout_node_labels = self.node_labels.clone();
+        if let Some(EditingLabel::Node(index)) = self.editing_label
+            && layout_node_labels.get(index).is_some_and(|label| label.text.is_empty())
+        {
+            layout_node_labels[index].text = String::from(" ");
+        }
+        let node_label_placements = crate::label::node_placements(
+            &self.elements,
+            &layout_node_labels,
+            &label_placements,
+        );
+        let mut layout_terminal_labels = self.terminal_labels.clone();
+        if let Some(EditingLabel::Terminal(index)) = self.editing_label
+            && layout_terminal_labels
+                .get(index)
+                .is_some_and(|label| label.text.is_empty())
+        {
+            layout_terminal_labels[index].text = String::from(" ");
+        }
+        let mut occupied_label_placements = label_placements.clone();
+        occupied_label_placements.extend(node_label_placements.iter().copied());
+        let terminal_label_placements = crate::label::node_placements(
+            &self.elements,
+            &layout_terminal_labels,
+            &occupied_label_placements,
+        );
+        let screen_label_placements: Vec<_> = label_placements
+            .iter()
+            .map(|placement| placement.map(|placement| crate::label::Placement {
+                rect: placement.rect.translate(origin),
+            }))
+            .collect();
+        let screen_node_label_placements: Vec<_> = node_label_placements
+            .iter()
+            .map(|placement| placement.map(|placement| crate::label::Placement {
+                rect: placement.rect.translate(origin),
+            }))
+            .collect();
+        let screen_terminal_label_placements: Vec<_> = terminal_label_placements
+            .iter()
+            .map(|placement| placement.map(|placement| crate::label::Placement {
+                rect: placement.rect.translate(origin),
+            }))
+            .collect();
+        draw_labels(
+            &painter,
+            &self.labels,
+            &screen_label_placements,
+            self.editing_label.and_then(|editing| match editing {
+                EditingLabel::Element(index) => Some(index),
+                EditingLabel::Node(_) => None,
+                EditingLabel::Terminal(_) => None,
+            }),
+        );
+        let node_label_text: Vec<_> = self.node_labels.iter().map(|label| label.text.clone()).collect();
+        draw_labels(
+            &painter,
+            &node_label_text,
+            &screen_node_label_placements,
+            self.editing_label.and_then(|editing| match editing {
+                EditingLabel::Node(index) => Some(index),
+                EditingLabel::Element(_) => None,
+                EditingLabel::Terminal(_) => None,
+            }),
+        );
+        let terminal_label_text: Vec<_> = self
+            .terminal_labels
+            .iter()
+            .map(|label| label.text.clone())
+            .collect();
+        draw_labels(
+            &painter,
+            &terminal_label_text,
+            &screen_terminal_label_placements,
+            self.editing_label.and_then(|editing| match editing {
+                EditingLabel::Terminal(index) => Some(index),
+                EditingLabel::Element(_) | EditingLabel::Node(_) => None,
+            }),
+        );
         self.draw_preview(&painter, pointer_position, origin);
         self.finish_drag(&response, pointer_position);
+        self.show_label_editor(
+            ui,
+            &screen_label_placements,
+            &screen_node_label_placements,
+            &screen_terminal_label_placements,
+        );
     }
 
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -144,7 +254,15 @@ impl Canvas {
                             } else {
                                 format!("{path}.svg")
                             };
-                            match std::fs::write(&path, exporter::svg(&self.elements)) {
+                            match std::fs::write(
+                                &path,
+                                exporter::svg(
+                                    &self.elements,
+                                    &self.labels,
+                                    &self.node_labels,
+                                    &self.terminal_labels,
+                                ),
+                            ) {
                                 Ok(()) => {
                                     self.export_status = Some(format!("Saved {path}"));
                                     close_dialog = true;
@@ -199,8 +317,12 @@ impl Canvas {
             // Unlike drawing modes, this performs its action immediately.
             if ui.button("Clean all").clicked() {
                 self.elements.clear();
+                self.labels.clear();
+                self.node_labels.clear();
+                self.terminal_labels.clear();
                 self.start = None;
                 self.dragged_endpoints.clear();
+                self.editing_label = None;
             }
         });
     }
@@ -217,8 +339,120 @@ impl Canvas {
             if let Some(position) = pointer_position {
                 if let Some(element_index) = element_at(&self.elements, position) {
                     self.elements.remove(element_index);
+                    self.labels.remove(element_index);
+                    self.editing_label = self.editing_label.and_then(|editing_index| {
+                        match editing_index {
+                            EditingLabel::Element(index) if index == element_index => None,
+                            EditingLabel::Element(index) => Some(EditingLabel::Element(
+                                index - usize::from(index > element_index),
+                            )),
+                            EditingLabel::Node(index) => Some(EditingLabel::Node(index)),
+                            EditingLabel::Terminal(index) => Some(EditingLabel::Terminal(index)),
+                        }
+                    });
+                    let positions = junction_positions(&self.elements);
+                    self.node_labels.retain(|label| positions.contains(&label.position));
+                    let terminals = unconnected_resistor_terminal_positions(&self.elements);
+                    self.terminal_labels
+                        .retain(|label| terminals.contains(&label.position));
                 }
             }
+        }
+    }
+
+    fn handle_label_click(
+        &mut self,
+        response: &egui::Response,
+        pointer_position: Option<egui::Pos2>,
+    ) {
+        if self.draw_mode != DrawMode::Erase && response.clicked() {
+            self.editing_label = pointer_position.and_then(|position| {
+                let junctions = junction_positions(&self.elements);
+                let terminals = unconnected_resistor_terminal_positions(&self.elements);
+                junctions
+                    .iter()
+                    .position(|node| node.distance(position) <= 10.0)
+                    .map(|index| {
+                        let node_position = junctions[index];
+                        let label_index = self
+                            .node_labels
+                            .iter()
+                            .position(|label| label.position == node_position)
+                            .unwrap_or_else(|| {
+                                self.node_labels.push(crate::label::NodeLabel {
+                                    position: node_position,
+                                    text: String::new(),
+                                });
+                                self.node_labels.len() - 1
+                            });
+                        EditingLabel::Node(label_index)
+                    })
+                    .or_else(|| {
+                        terminals
+                            .iter()
+                            .position(|terminal| terminal.distance(position) <= 10.0)
+                            .map(|index| {
+                                let terminal_position = terminals[index];
+                                let label_index = self
+                                    .terminal_labels
+                                    .iter()
+                                    .position(|label| label.position == terminal_position)
+                                    .unwrap_or_else(|| {
+                                        self.terminal_labels.push(crate::label::NodeLabel {
+                                            position: terminal_position,
+                                            text: String::new(),
+                                        });
+                                        self.terminal_labels.len() - 1
+                                    });
+                                EditingLabel::Terminal(label_index)
+                            })
+                    })
+                    .or_else(|| element_at(&self.elements, position).map(EditingLabel::Element))
+            });
+        }
+    }
+
+    fn show_label_editor(
+        &mut self,
+        ui: &egui::Ui,
+        placements: &[Option<crate::label::Placement>],
+        node_placements: &[Option<crate::label::Placement>],
+        terminal_placements: &[Option<crate::label::Placement>],
+    ) {
+        let Some(editing) = self.editing_label else {
+            return;
+        };
+        let (index, placement) = match editing {
+            EditingLabel::Element(index) => (index, placements.get(index)),
+            EditingLabel::Node(index) => (index, node_placements.get(index)),
+            EditingLabel::Terminal(index) => (index, terminal_placements.get(index)),
+        };
+        let Some(Some(placement)) = placement else {
+            self.editing_label = None;
+            return;
+        };
+
+        let mut finish_editing = false;
+        egui::Area::new(egui::Id::new(("label", editing)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(placement.rect.left_top())
+            .show(ui.ctx(), |ui| {
+                let response = ui.add_sized(
+                    placement.rect.size(),
+                    egui::TextEdit::singleline(match editing {
+                        EditingLabel::Element(_) => &mut self.labels[index],
+                        EditingLabel::Node(_) => &mut self.node_labels[index].text,
+                        EditingLabel::Terminal(_) => &mut self.terminal_labels[index].text,
+                    }),
+                );
+                finish_editing = response.has_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if !finish_editing {
+                    response.request_focus();
+                }
+            });
+        if finish_editing {
+            self.editing_label = None;
         }
     }
 
@@ -265,10 +499,29 @@ impl Canvas {
             let snapped_position = can_snap
                 .then(|| snap_to_endpoint(&self.elements, position, &self.dragged_endpoints))
                 .unwrap_or(position);
+            let previous_positions: Vec<_> = self
+                .dragged_endpoints
+                .iter()
+                .map(|endpoint| {
+                    let (start, end) = self.elements[endpoint.element_index].endpoints();
+                    if endpoint.is_start { start } else { end }
+                })
+                .collect();
             for endpoint in &self.dragged_endpoints {
                 self.elements[endpoint.element_index]
                     .move_endpoint(endpoint.is_start, snapped_position);
             }
+            for node_label in &mut self.node_labels {
+                if previous_positions.contains(&node_label.position) {
+                    node_label.position = snapped_position;
+                }
+            }
+            let junctions = junction_positions(&self.elements);
+            self.node_labels
+                .retain(|node_label| junctions.contains(&node_label.position));
+            let terminals = unconnected_resistor_terminal_positions(&self.elements);
+            self.terminal_labels
+                .retain(|terminal_label| terminals.contains(&terminal_label.position));
         }
     }
 
@@ -295,6 +548,11 @@ impl Canvas {
 
     fn finish_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         if !response.drag_stopped() {
+            // A click is not considered a drag by egui. Discard its provisional drawing start;
+            // it may instead have selected an existing element for labeling.
+            if response.clicked() {
+                self.start = None;
+            }
             return;
         }
 
@@ -312,6 +570,12 @@ impl Canvas {
                     self.elements.push(Element::PrescribedFlow(start, end))
                 }
                 DrawMode::Move | DrawMode::Erase => {}
+            }
+            if matches!(
+                self.draw_mode,
+                DrawMode::Line | DrawMode::Resistor | DrawMode::PrescribedFlow
+            ) {
+                self.labels.push(String::new());
             }
         }
 

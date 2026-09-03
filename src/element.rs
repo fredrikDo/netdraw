@@ -116,6 +116,60 @@ pub fn overlapping_endpoints(
         .collect()
 }
 
+// Positions represented by the junction dots on the canvas.
+pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
+    let mut positions = Vec::new();
+
+    for element in elements {
+        if let Element::Resistor(start, end) = element {
+            for position in [*start, *end] {
+                let count = elements
+                    .iter()
+                    .filter_map(|other| match other {
+                        Element::Resistor(other_start, other_end) => Some([*other_start, *other_end]),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter(|other| *other == position)
+                    .count();
+                if count >= 2 && !positions.contains(&position) {
+                    positions.push(position);
+                }
+            }
+        }
+    }
+
+    for element in elements {
+        if let Element::PrescribedFlow(_, end) = element
+            && !positions.contains(end)
+        {
+            positions.push(*end);
+        }
+    }
+
+    positions
+}
+
+pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui::Pos2> {
+    let all_endpoints: Vec<_> = elements
+        .iter()
+        .flat_map(|element| {
+            let (start, end) = element.endpoints();
+            [start, end]
+        })
+        .collect();
+
+    elements
+        .iter()
+        .filter_map(|element| match element {
+            Element::Resistor(start, end) => Some([*start, *end]),
+            _ => None,
+        })
+        .flatten()
+        .filter(|position| all_endpoints.iter().filter(|other| **other == *position).count() == 1)
+        .collect()
+}
+
 // Returns the closest existing endpoint inside the snap radius, or the original position.
 // `ignored_endpoints` prevents dragged handles from snapping to their old positions.
 pub fn snap_to_endpoint(

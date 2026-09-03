@@ -3,14 +3,31 @@ use std::fmt::Write;
 use eframe::egui;
 
 use crate::element::Element;
+use crate::label;
 
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 const JUNCTION_NODE_RADIUS: f32 = 3.0;
 const RESISTOR_TERMINAL_LENGTH: f32 = 16.0;
 const STROKE_MARGIN: f32 = 1.0;
 
-pub fn svg(elements: &[Element]) -> String {
-    let bounds = Bounds::for_elements(elements);
+pub fn svg(
+    elements: &[Element],
+    labels: &[String],
+    node_labels: &[label::NodeLabel],
+    terminal_labels: &[label::NodeLabel],
+) -> String {
+    let label_placements = label::placements(elements, labels);
+    let node_label_placements = label::node_placements(elements, node_labels, &label_placements);
+    let mut occupied_placements = label_placements.clone();
+    occupied_placements.extend(node_label_placements.iter().copied());
+    let terminal_label_placements =
+        label::node_placements(elements, terminal_labels, &occupied_placements);
+    let bounds = Bounds::for_elements(
+        elements,
+        &label_placements,
+        &node_label_placements,
+        &terminal_label_placements,
+    );
     let mut output = String::new();
     writeln!(
         output,
@@ -39,6 +56,42 @@ pub fn svg(elements: &[Element]) -> String {
     junction_nodes(&mut output, elements);
 
     writeln!(output, "  </g>").unwrap();
+    for (label, placement) in labels.iter().zip(&label_placements) {
+        if let Some(placement) = placement {
+            writeln!(
+                output,
+                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                placement.rect.left(),
+                placement.rect.top() + 14.0,
+                escape_xml(label)
+            )
+            .unwrap();
+        }
+    }
+    for (node_label, placement) in node_labels.iter().zip(&node_label_placements) {
+        if let Some(placement) = placement {
+            writeln!(
+                output,
+                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                placement.rect.left(),
+                placement.rect.top() + 14.0,
+                escape_xml(&node_label.text)
+            )
+            .unwrap();
+        }
+    }
+    for (terminal_label, placement) in terminal_labels.iter().zip(&terminal_label_placements) {
+        if let Some(placement) = placement {
+            writeln!(
+                output,
+                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                placement.rect.left(),
+                placement.rect.top() + 14.0,
+                escape_xml(&terminal_label.text)
+            )
+            .unwrap();
+        }
+    }
     writeln!(output, "  </g>").unwrap();
     writeln!(output, "</svg>").unwrap();
     output
@@ -50,7 +103,12 @@ struct Bounds {
 }
 
 impl Bounds {
-    fn for_elements(elements: &[Element]) -> Self {
+    fn for_elements(
+        elements: &[Element],
+        labels: &[Option<label::Placement>],
+        node_labels: &[Option<label::Placement>],
+        terminal_labels: &[Option<label::Placement>],
+    ) -> Self {
         let mut bounds = Self {
             min: egui::pos2(f32::INFINITY, f32::INFINITY),
             max: egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY),
@@ -68,6 +126,18 @@ impl Bounds {
         }
         bounds.include_resistor_terminal_ticks(elements);
         bounds.include_junction_nodes(elements);
+        for placement in labels.iter().flatten() {
+            bounds.include(placement.rect.min);
+            bounds.include(placement.rect.max);
+        }
+        for placement in node_labels.iter().flatten() {
+            bounds.include(placement.rect.min);
+            bounds.include(placement.rect.max);
+        }
+        for placement in terminal_labels.iter().flatten() {
+            bounds.include(placement.rect.min);
+            bounds.include(placement.rect.max);
+        }
 
         if !bounds.min.x.is_finite() {
             return Self {
@@ -198,6 +268,15 @@ impl Bounds {
     fn height(&self) -> f32 {
         self.max.y - self.min.y
     }
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
@@ -362,7 +441,12 @@ mod tests {
             Element::PrescribedFlow(egui::pos2(20.0, 20.0), egui::pos2(120.0, 20.0)),
         ];
 
-        let document = svg(&elements);
+        let document = svg(
+            &elements,
+            &[String::new(), String::new(), String::new()],
+            &[],
+            &[],
+        );
 
         assert!(document.starts_with("<svg"));
         assert!(document.contains("width=\"124\""));
@@ -370,5 +454,14 @@ mod tests {
         assert!(document.contains("<path"));
         assert!(document.contains("<circle"));
         assert!(document.ends_with("</svg>\n"));
+    }
+
+    #[test]
+    fn exports_escaped_labels() {
+        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
+        let document = svg(&elements, &[String::from("R<1 & R>2")], &[], &[]);
+
+        assert!(document.contains("<text"));
+        assert!(document.contains("R&lt;1 &amp; R&gt;2"));
     }
 }
