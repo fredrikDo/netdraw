@@ -15,13 +15,15 @@ pub fn svg(
     labels: &[String],
     node_labels: &[label::NodeLabel],
     terminal_labels: &[label::NodeLabel],
+    label_style: label::LabelStyle,
 ) -> String {
-    let label_placements = label::placements(elements, labels);
-    let node_label_placements = label::node_placements(elements, node_labels, &label_placements);
+    let label_placements = label::placements(elements, labels, label_style);
+    let node_label_placements =
+        label::node_placements(elements, node_labels, &label_placements, label_style);
     let mut occupied_placements = label_placements.clone();
     occupied_placements.extend(node_label_placements.iter().copied());
     let terminal_label_placements =
-        label::node_placements(elements, terminal_labels, &occupied_placements);
+        label::node_placements(elements, terminal_labels, &occupied_placements, label_style);
     let bounds = Bounds::for_elements(
         elements,
         &label_placements,
@@ -60,9 +62,11 @@ pub fn svg(
         if let Some(placement) = placement {
             writeln!(
                 output,
-                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
                 placement.rect.left(),
-                placement.rect.top() + 14.0,
+                placement.rect.top() + label_style.size,
+                label_style.svg_family(),
+                label_style.size,
                 escape_xml(label)
             )
             .unwrap();
@@ -72,9 +76,11 @@ pub fn svg(
         if let Some(placement) = placement {
             writeln!(
                 output,
-                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
                 placement.rect.left(),
-                placement.rect.top() + 14.0,
+                placement.rect.top() + label_style.size,
+                label_style.svg_family(),
+                label_style.size,
                 escape_xml(&node_label.text)
             )
             .unwrap();
@@ -84,9 +90,11 @@ pub fn svg(
         if let Some(placement) = placement {
             writeln!(
                 output,
-                r#"  <text x="{}" y="{}" font-family="sans-serif" font-size="14" fill="black">{}</text>"#,
+                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
                 placement.rect.left(),
-                placement.rect.top() + 14.0,
+                placement.rect.top() + label_style.size,
+                label_style.svg_family(),
+                label_style.size,
                 escape_xml(&terminal_label.text)
             )
             .unwrap();
@@ -446,6 +454,7 @@ mod tests {
             &[String::new(), String::new(), String::new()],
             &[],
             &[],
+            label::LabelStyle::default(),
         );
 
         assert!(document.starts_with("<svg"));
@@ -459,9 +468,36 @@ mod tests {
     #[test]
     fn exports_escaped_labels() {
         let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
-        let document = svg(&elements, &[String::from("R<1 & R>2")], &[], &[]);
+        let document = svg(
+            &elements,
+            &[String::from("R<1 & R>2")],
+            &[],
+            &[],
+            label::LabelStyle::default(),
+        );
 
         assert!(document.contains("<text"));
         assert!(document.contains("R&lt;1 &amp; R&gt;2"));
+    }
+
+    #[test]
+    fn exports_selected_label_typography() {
+        let elements = [Element::Line(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
+        let document = svg(
+            &elements,
+            &[String::from("R1")],
+            &[],
+            &[],
+            label::LabelStyle {
+                font: label::LabelFont::Monospace,
+                size: 22.0,
+            },
+        );
+
+        assert!(document.contains(r#"font-family="monospace""#));
+        assert!(document.contains(r#"font-size="22""#));
     }
 }

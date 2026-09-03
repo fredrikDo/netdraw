@@ -2,9 +2,55 @@ use eframe::egui;
 
 use crate::element::Element;
 
-const FONT_HEIGHT: f32 = 18.0;
-const CHARACTER_WIDTH: f32 = 8.0;
 const ELEMENT_CLEARANCE: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelFont {
+    Proportional,
+    Monospace,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LabelStyle {
+    pub font: LabelFont,
+    pub size: f32,
+}
+
+impl Default for LabelStyle {
+    fn default() -> Self {
+        Self {
+            font: LabelFont::Proportional,
+            size: 18.0,
+        }
+    }
+}
+
+impl LabelStyle {
+    pub fn font_id(self) -> egui::FontId {
+        match self.font {
+            LabelFont::Proportional => egui::FontId::proportional(self.size),
+            LabelFont::Monospace => egui::FontId::monospace(self.size),
+        }
+    }
+
+    pub fn svg_family(self) -> &'static str {
+        match self.font {
+            LabelFont::Proportional => "sans-serif",
+            LabelFont::Monospace => "monospace",
+        }
+    }
+
+    fn text_size(self, text: &str) -> egui::Vec2 {
+        let character_width = match self.font {
+            LabelFont::Proportional => self.size * 0.57,
+            LabelFont::Monospace => self.size * 0.60,
+        };
+        egui::vec2(
+            text.chars().count() as f32 * character_width + 4.0,
+            self.size + 4.0,
+        )
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Placement {
@@ -17,7 +63,11 @@ pub struct NodeLabel {
     pub text: String,
 }
 
-pub fn placements(elements: &[Element], labels: &[String]) -> Vec<Option<Placement>> {
+pub fn placements(
+    elements: &[Element],
+    labels: &[String],
+    style: LabelStyle,
+) -> Vec<Option<Placement>> {
     let mut placed: Vec<Option<Placement>> = Vec::with_capacity(elements.len());
 
     for (index, element) in elements.iter().enumerate() {
@@ -27,7 +77,7 @@ pub fn placements(elements: &[Element], labels: &[String]) -> Vec<Option<Placeme
             continue;
         }
 
-        let size = egui::vec2(label.chars().count() as f32 * CHARACTER_WIDTH + 4.0, FONT_HEIGHT);
+        let size = style.text_size(label);
         let (start, end) = element.endpoints();
         let offset = end - start;
         let direction = if offset.length_sq() > 0.0 {
@@ -71,6 +121,7 @@ pub fn node_placements(
     elements: &[Element],
     node_labels: &[NodeLabel],
     occupied: &[Option<Placement>],
+    style: LabelStyle,
 ) -> Vec<Option<Placement>> {
     let mut placed: Vec<Option<Placement>> = occupied.to_vec();
     let mut node_placements = Vec::with_capacity(node_labels.len());
@@ -80,10 +131,7 @@ pub fn node_placements(
             node_placements.push(None);
             continue;
         }
-        let size = egui::vec2(
-            node_label.text.chars().count() as f32 * CHARACTER_WIDTH + 4.0,
-            FONT_HEIGHT,
-        );
+        let size = style.text_size(&node_label.text);
         let mut placement = None;
         for distance in [28.0, 46.0, 64.0, 82.0, 100.0] {
             for offset in [

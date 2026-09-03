@@ -15,12 +15,24 @@ use crate::{
 };
 
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
+const TOOL_BUTTON_SIZE: f32 = 36.0;
+
+#[derive(Clone, Copy)]
+enum ToolIcon {
+    Line,
+    Resistor,
+    PrescribedFlow,
+    Move,
+    Erase,
+    Typography,
+    CleanAll,
+}
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     let mut canvas = Canvas::default();
 
-    eframe::run_ui_native("Simple Drawing", options, move |ui, _frame| {
+    eframe::run_ui_native("NetDraw", options, move |ui, _frame| {
         canvas.show(ui);
     })
 }
@@ -38,6 +50,8 @@ struct Canvas {
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
+    label_style_dialog_open: bool,
+    label_style: crate::label::LabelStyle,
     editing_label: Option<EditingLabel>,
 }
 
@@ -61,6 +75,8 @@ impl Default for Canvas {
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
             export_status: None,
+            label_style_dialog_open: false,
+            label_style: crate::label::LabelStyle::default(),
             editing_label: None,
         }
     }
@@ -71,6 +87,7 @@ impl Canvas {
         self.show_menu_bar(ui);
         self.show_toolbar(ui);
         self.show_export_dialog(ui.ctx());
+        self.show_label_style_dialog(ui.ctx());
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -107,7 +124,8 @@ impl Canvas {
         {
             layout_labels[index] = String::from(" ");
         }
-        let label_placements = crate::label::placements(&self.elements, &layout_labels);
+        let label_placements =
+            crate::label::placements(&self.elements, &layout_labels, self.label_style);
         let mut layout_node_labels = self.node_labels.clone();
         if let Some(EditingLabel::Node(index)) = self.editing_label
             && layout_node_labels.get(index).is_some_and(|label| label.text.is_empty())
@@ -118,6 +136,7 @@ impl Canvas {
             &self.elements,
             &layout_node_labels,
             &label_placements,
+            self.label_style,
         );
         let mut layout_terminal_labels = self.terminal_labels.clone();
         if let Some(EditingLabel::Terminal(index)) = self.editing_label
@@ -133,6 +152,7 @@ impl Canvas {
             &self.elements,
             &layout_terminal_labels,
             &occupied_label_placements,
+            self.label_style,
         );
         let screen_label_placements: Vec<_> = label_placements
             .iter()
@@ -161,6 +181,7 @@ impl Canvas {
                 EditingLabel::Node(_) => None,
                 EditingLabel::Terminal(_) => None,
             }),
+            self.label_style,
         );
         let node_label_text: Vec<_> = self.node_labels.iter().map(|label| label.text.clone()).collect();
         draw_labels(
@@ -172,6 +193,7 @@ impl Canvas {
                 EditingLabel::Element(_) => None,
                 EditingLabel::Terminal(_) => None,
             }),
+            self.label_style,
         );
         let terminal_label_text: Vec<_> = self
             .terminal_labels
@@ -186,6 +208,7 @@ impl Canvas {
                 EditingLabel::Terminal(index) => Some(index),
                 EditingLabel::Element(_) | EditingLabel::Node(_) => None,
             }),
+            self.label_style,
         );
         self.draw_preview(&painter, pointer_position, origin);
         self.finish_drag(&response, pointer_position);
@@ -261,6 +284,7 @@ impl Canvas {
                                     &self.labels,
                                     &self.node_labels,
                                     &self.terminal_labels,
+                                    self.label_style,
                                 ),
                             ) {
                                 Ok(()) => {
@@ -303,19 +327,82 @@ impl Canvas {
             .map(|path| path.to_string_lossy().into_owned())
     }
 
+    fn show_label_style_dialog(&mut self, ctx: &egui::Context) {
+        if !self.label_style_dialog_open {
+            return;
+        }
+
+        let mut open = self.label_style_dialog_open;
+        egui::Window::new("Label typography")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("label_style_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Font");
+                        egui::ComboBox::from_id_salt("label_font")
+                            .selected_text(match self.label_style.font {
+                                crate::label::LabelFont::Proportional => "Proportional",
+                                crate::label::LabelFont::Monospace => "Monospace",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.label_style.font,
+                                    crate::label::LabelFont::Proportional,
+                                    "Proportional",
+                                );
+                                ui.selectable_value(
+                                    &mut self.label_style.font,
+                                    crate::label::LabelFont::Monospace,
+                                    "Monospace",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label("Font size");
+                        ui.add(
+                            egui::DragValue::new(&mut self.label_style.size)
+                                .range(8.0..=48.0)
+                                .speed(0.5)
+                                .suffix(" px"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Label preview")
+                        .font(self.label_style.font_id()),
+                );
+            });
+        self.label_style_dialog_open = open;
+    }
+
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Draw:");
-            self.select_mode(ui, DrawMode::Line, "Line");
-            self.select_mode(ui, DrawMode::Resistor, "Resistance");
-            self.select_mode(ui, DrawMode::PrescribedFlow, "Prescribed flow");
+            //ui.label("Draw:");
+            self.select_mode(ui, DrawMode::Line, ToolIcon::Line, "Line");
+            self.select_mode(
+                ui,
+                DrawMode::Resistor,
+                ToolIcon::Resistor,
+                "Resistance",
+            );
+            self.select_mode(
+                ui,
+                DrawMode::PrescribedFlow,
+                ToolIcon::PrescribedFlow,
+                "Prescribed flow",
+            );
             ui.separator();
-            self.select_mode(ui, DrawMode::Move, "Move");
+            self.select_mode(ui, DrawMode::Move, ToolIcon::Move, "Move");
             ui.separator();
-            self.select_mode(ui, DrawMode::Erase, "Erase");
-
+            self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
             // Unlike drawing modes, this performs its action immediately.
-            if ui.button("Clean all").clicked() {
+            if Self::tool_button(ui, false, ToolIcon::CleanAll, "Clean all").clicked() {
                 self.elements.clear();
                 self.labels.clear();
                 self.node_labels.clear();
@@ -324,12 +411,193 @@ impl Canvas {
                 self.dragged_endpoints.clear();
                 self.editing_label = None;
             }
+            ui.separator();
+            if Self::tool_button(ui, false, ToolIcon::Typography, "Label typography").clicked() {
+                self.label_style_dialog_open = true;
+            }
         });
     }
 
-    fn select_mode(&mut self, ui: &mut egui::Ui, mode: DrawMode, label: &str) {
-        if ui.selectable_label(self.draw_mode == mode, label).clicked() {
+    fn select_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        mode: DrawMode,
+        icon: ToolIcon,
+        label: &str,
+    ) {
+        if Self::tool_button(ui, self.draw_mode == mode, icon, label).clicked() {
             self.draw_mode = mode;
+        }
+    }
+
+    fn tool_button(
+        ui: &mut egui::Ui,
+        selected: bool,
+        icon: ToolIcon,
+        label: &str,
+    ) -> egui::Response {
+        let response = ui.add(
+            egui::Button::new("")
+                .selected(selected)
+                .min_size(egui::Vec2::splat(TOOL_BUTTON_SIZE)),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                selected,
+                label,
+            )
+        });
+
+        let color = ui.style().interact(&response).fg_stroke.color;
+        Self::paint_tool_icon(ui.painter(), response.rect.shrink(7.0), icon, color);
+        response.on_hover_text(label)
+    }
+
+    fn paint_tool_icon(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        icon: ToolIcon,
+        color: egui::Color32,
+    ) {
+        let center = rect.center();
+        let stroke = egui::Stroke::new(1.8, color);
+        let left = egui::pos2(rect.left(), center.y);
+        let right = egui::pos2(rect.right(), center.y);
+
+        match icon {
+            ToolIcon::Line => {
+                painter.line_segment([left, right], stroke);
+            }
+            ToolIcon::Resistor => {
+                let lead = rect.width() * 0.18;
+                let body_left = left + egui::vec2(lead, 0.0);
+                let body_right = right - egui::vec2(lead, 0.0);
+                painter.line_segment([left, body_left], stroke);
+                painter.line_segment([body_right, right], stroke);
+
+                let amplitude = rect.height() * 0.28;
+                let mut points = vec![body_left];
+                for index in 1..6 {
+                    let fraction = index as f32 / 6.0;
+                    let y = if index % 2 == 1 { -amplitude } else { amplitude };
+                    points.push(egui::pos2(
+                        egui::lerp(body_left.x..=body_right.x, fraction),
+                        center.y + y,
+                    ));
+                }
+                points.push(body_right);
+                painter.add(egui::Shape::line(points, stroke));
+            }
+            ToolIcon::PrescribedFlow => {
+                let radius = rect.height() * 0.36;
+                painter.line_segment([left, center - egui::vec2(radius, 0.0)], stroke);
+                painter.line_segment([center + egui::vec2(radius, 0.0), right], stroke);
+                painter.circle_stroke(center, radius, stroke);
+                let arrow_start = center - egui::vec2(radius * 0.55, 0.0);
+                let arrow_tip = center + egui::vec2(radius * 0.55, 0.0);
+                painter.line_segment([arrow_start, arrow_tip], stroke);
+                painter.line_segment(
+                    [arrow_tip, arrow_tip + egui::vec2(-3.5, -3.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [arrow_tip, arrow_tip + egui::vec2(-3.5, 3.0)],
+                    stroke,
+                );
+            }
+            ToolIcon::Move => {
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), center.y),
+                        egui::pos2(rect.right(), center.y),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x, rect.top()),
+                        egui::pos2(center.x, rect.bottom()),
+                    ],
+                    stroke,
+                );
+                for (tip, offset_a, offset_b) in [
+                    (left, egui::vec2(4.0, -3.0), egui::vec2(4.0, 3.0)),
+                    (right, egui::vec2(-4.0, -3.0), egui::vec2(-4.0, 3.0)),
+                    (
+                        egui::pos2(center.x, rect.top()),
+                        egui::vec2(-3.0, 4.0),
+                        egui::vec2(3.0, 4.0),
+                    ),
+                    (
+                        egui::pos2(center.x, rect.bottom()),
+                        egui::vec2(-3.0, -4.0),
+                        egui::vec2(3.0, -4.0),
+                    ),
+                ] {
+                    painter.line_segment([tip, tip + offset_a], stroke);
+                    painter.line_segment([tip, tip + offset_b], stroke);
+                }
+            }
+            ToolIcon::Erase => {
+                let points = [
+                    center + egui::vec2(-7.0, 4.0),
+                    center + egui::vec2(2.0, -7.0),
+                    center + egui::vec2(8.0, -2.0),
+                    center + egui::vec2(-1.0, 9.0),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    points.to_vec(),
+                    egui::Color32::TRANSPARENT,
+                    stroke,
+                ));
+                painter.line_segment([points[0], points[3]], stroke);
+            }
+            ToolIcon::Typography => {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "Aa",
+                    egui::FontId::proportional(15.0),
+                    color,
+                );
+            }
+            ToolIcon::CleanAll => {
+                let body = egui::Rect::from_min_max(
+                    center + egui::vec2(-6.0, -5.0),
+                    center + egui::vec2(6.0, 8.0),
+                );
+                painter.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-8.0, -8.0),
+                        center + egui::vec2(8.0, -8.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-3.0, -10.0),
+                        center + egui::vec2(3.0, -10.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-2.0, -2.0),
+                        center + egui::vec2(-2.0, 5.0),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(2.0, -2.0),
+                        center + egui::vec2(2.0, 5.0),
+                    ],
+                    stroke,
+                );
+            }
         }
     }
 

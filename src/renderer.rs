@@ -1,12 +1,12 @@
 use eframe::egui;
 
 use crate::element::{Element, ENDPOINT_RADIUS};
-use crate::label::Placement;
+use crate::label::{LabelStyle, Placement};
 
 // Endpoint handles appear only when the pointer is close enough to interact with them.
 const HANDLE_HOVER_DISTANCE: f32 = 24.0;
 const JUNCTION_NODE_RADIUS: f32 = 3.0;
-const RESISTOR_TERMINAL_LENGTH: f32 = 16.0;
+const RESISTOR_TERMINAL_LENGTH: f32 = 20.0;
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 
 pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
@@ -20,6 +20,7 @@ pub fn draw_labels(
     labels: &[String],
     placements: &[Option<Placement>],
     editing_label: Option<usize>,
+    style: LabelStyle,
 ) {
     for (index, (label, placement)) in labels.iter().zip(placements).enumerate() {
         if label.is_empty() || editing_label == Some(index) {
@@ -30,7 +31,7 @@ pub fn draw_labels(
                 placement.rect.left_top(),
                 egui::Align2::LEFT_TOP,
                 label,
-                egui::FontId::proportional(14.0),
+                style.font_id(),
                 egui::Color32::BLACK,
             );
         }
