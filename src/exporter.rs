@@ -2,28 +2,33 @@ use std::fmt::Write;
 
 use eframe::egui;
 
-use crate::element::Element;
+use crate::element::{Element, RESISTOR_TERMINAL_LENGTH};
 use crate::label;
 
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 const JUNCTION_NODE_RADIUS: f32 = 3.0;
-const RESISTOR_TERMINAL_LENGTH: f32 = 16.0;
 const STROKE_MARGIN: f32 = 1.0;
 
 pub fn svg(
+    ctx: &egui::Context,
     elements: &[Element],
     labels: &[String],
     node_labels: &[label::NodeLabel],
     terminal_labels: &[label::NodeLabel],
     label_style: label::LabelStyle,
 ) -> String {
-    let label_placements = label::placements(elements, labels, label_style);
+    let label_placements = label::placements(ctx, elements, labels, label_style);
     let node_label_placements =
-        label::node_placements(elements, node_labels, &label_placements, label_style);
+        label::node_placements(ctx, elements, node_labels, &label_placements, label_style);
     let mut occupied_placements = label_placements.clone();
     occupied_placements.extend(node_label_placements.iter().copied());
-    let terminal_label_placements =
-        label::node_placements(elements, terminal_labels, &occupied_placements, label_style);
+    let terminal_label_placements = label::terminal_placements(
+        ctx,
+        elements,
+        terminal_labels,
+        &occupied_placements,
+        label_style,
+    );
     let bounds = Bounds::for_elements(
         elements,
         &label_placements,
@@ -441,6 +446,13 @@ fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
 mod tests {
     use super::*;
 
+    fn test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        ctx
+    }
+
     #[test]
     fn exports_every_element_type() {
         let elements = [
@@ -448,8 +460,10 @@ mod tests {
             Element::Resistor(egui::pos2(10.0, 10.0), egui::pos2(110.0, 10.0)),
             Element::PrescribedFlow(egui::pos2(20.0, 20.0), egui::pos2(120.0, 20.0)),
         ];
+        let ctx = test_context();
 
         let document = svg(
+            &ctx,
             &elements,
             &[String::new(), String::new(), String::new()],
             &[],
@@ -459,7 +473,7 @@ mod tests {
 
         assert!(document.starts_with("<svg"));
         assert!(document.contains("width=\"124\""));
-        assert!(document.contains("height=\"36\""));
+        assert!(document.contains("height=\"38\""));
         assert!(document.contains("<path"));
         assert!(document.contains("<circle"));
         assert!(document.ends_with("</svg>\n"));
@@ -468,7 +482,9 @@ mod tests {
     #[test]
     fn exports_escaped_labels() {
         let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
+        let ctx = test_context();
         let document = svg(
+            &ctx,
             &elements,
             &[String::from("R<1 & R>2")],
             &[],
@@ -486,7 +502,9 @@ mod tests {
             egui::pos2(0.0, 0.0),
             egui::pos2(100.0, 0.0),
         )];
+        let ctx = test_context();
         let document = svg(
+            &ctx,
             &elements,
             &[String::from("R1")],
             &[],

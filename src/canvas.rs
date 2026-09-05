@@ -125,7 +125,7 @@ impl Canvas {
             layout_labels[index] = String::from(" ");
         }
         let label_placements =
-            crate::label::placements(&self.elements, &layout_labels, self.label_style);
+            crate::label::placements(ui.ctx(), &self.elements, &layout_labels, self.label_style);
         let mut layout_node_labels = self.node_labels.clone();
         if let Some(EditingLabel::Node(index)) = self.editing_label
             && layout_node_labels.get(index).is_some_and(|label| label.text.is_empty())
@@ -133,6 +133,7 @@ impl Canvas {
             layout_node_labels[index].text = String::from(" ");
         }
         let node_label_placements = crate::label::node_placements(
+            ui.ctx(),
             &self.elements,
             &layout_node_labels,
             &label_placements,
@@ -148,7 +149,8 @@ impl Canvas {
         }
         let mut occupied_label_placements = label_placements.clone();
         occupied_label_placements.extend(node_label_placements.iter().copied());
-        let terminal_label_placements = crate::label::node_placements(
+        let terminal_label_placements = crate::label::terminal_placements(
+            ui.ctx(),
             &self.elements,
             &layout_terminal_labels,
             &occupied_label_placements,
@@ -280,6 +282,7 @@ impl Canvas {
                             match std::fs::write(
                                 &path,
                                 exporter::svg(
+                                    ctx,
                                     &self.elements,
                                     &self.labels,
                                     &self.node_labels,
@@ -711,7 +714,8 @@ impl Canvas {
                         EditingLabel::Element(_) => &mut self.labels[index],
                         EditingLabel::Node(_) => &mut self.node_labels[index].text,
                         EditingLabel::Terminal(_) => &mut self.terminal_labels[index].text,
-                    }),
+                    })
+                    .font(self.label_style.font_id()),
                 );
                 finish_editing = response.has_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));

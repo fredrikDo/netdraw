@@ -40,15 +40,11 @@ impl LabelStyle {
         }
     }
 
-    fn text_size(self, text: &str) -> egui::Vec2 {
-        let character_width = match self.font {
-            LabelFont::Proportional => self.size * 0.57,
-            LabelFont::Monospace => self.size * 0.60,
-        };
-        egui::vec2(
-            text.chars().count() as f32 * character_width + 4.0,
-            self.size + 4.0,
-        )
+    fn text_size(self, ctx: &egui::Context, text: &str) -> egui::Vec2 {
+        let galley = ctx.fonts_mut(|fonts| {
+            fonts.layout_no_wrap(text.to_owned(), self.font_id(), egui::Color32::BLACK)
+        });
+        galley.size() + egui::vec2(4.0, 4.0)
     }
 }
 
@@ -64,6 +60,7 @@ pub struct NodeLabel {
 }
 
 pub fn placements(
+    ctx: &egui::Context,
     elements: &[Element],
     labels: &[String],
     style: LabelStyle,
@@ -77,7 +74,7 @@ pub fn placements(
             continue;
         }
 
-        let size = style.text_size(label);
+        let size = style.text_size(ctx, label);
         let (start, end) = element.endpoints();
         let offset = end - start;
         let direction = if offset.length_sq() > 0.0 {
@@ -118,6 +115,7 @@ pub fn placements(
 }
 
 pub fn node_placements(
+    ctx: &egui::Context,
     elements: &[Element],
     node_labels: &[NodeLabel],
     occupied: &[Option<Placement>],
@@ -131,7 +129,7 @@ pub fn node_placements(
             node_placements.push(None);
             continue;
         }
-        let size = style.text_size(&node_label.text);
+        let size = style.text_size(ctx, &node_label.text);
         let mut placement = None;
         for distance in [28.0, 46.0, 64.0, 82.0, 100.0] {
             for offset in [
@@ -164,6 +162,67 @@ pub fn node_placements(
     }
 
     node_placements
+}
+
+pub fn terminal_placements(
+    ctx: &egui::Context,
+    elements: &[Element],
+    terminal_labels: &[NodeLabel],
+    occupied: &[Option<Placement>],
+    style: LabelStyle,
+) -> Vec<Option<Placement>> {
+    let mut placed: Vec<Option<Placement>> = occupied.to_vec();
+    let mut terminal_placements = Vec::with_capacity(terminal_labels.len());
+
+    for terminal_label in terminal_labels {
+        if terminal_label.text.is_empty() {
+            terminal_placements.push(None);
+            continue;
+        }
+
+        let Some(direction) = terminal_direction(elements, terminal_label.position) else {
+            terminal_placements.push(None);
+            continue;
+        };
+        let size = style.text_size(ctx, &terminal_label.text);
+        let inline_radius =
+            direction.x.abs() * size.x * 0.5 + direction.y.abs() * size.y * 0.5;
+        let candidate = |clearance| {
+            egui::Rect::from_center_size(
+                terminal_label.position + direction * (inline_radius + clearance),
+                size,
+            )
+        };
+        let rect = [8.0, 26.0, 44.0, 62.0, 80.0]
+            .into_iter()
+            .map(candidate)
+            .find(|rect| {
+                elements.iter().all(|element| clears_element(*rect, *element))
+                    && placed.iter().flatten().all(|other| !rect.intersects(other.rect))
+            })
+            .unwrap_or_else(|| candidate(8.0));
+        let placement = Some(Placement { rect });
+        placed.push(placement);
+        terminal_placements.push(placement);
+    }
+
+    terminal_placements
+}
+
+fn terminal_direction(elements: &[Element], position: egui::Pos2) -> Option<egui::Vec2> {
+    elements.iter().find_map(|element| {
+        let Element::Resistor(start, end) = *element else {
+            return None;
+        };
+        let inward = if start == position {
+            end - start
+        } else if end == position {
+            start - end
+        } else {
+            return None;
+        };
+        (inward.length_sq() > 0.0).then(|| -inward.normalized())
+    })
 }
 
 fn clears_element(rect: egui::Rect, element: Element) -> bool {
@@ -205,4 +264,49 @@ fn segments_intersect(
 
 fn cross(first: egui::Vec2, second: egui::Vec2) -> f32 {
     first.x * second.y - first.y * second.x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        ctx
+    }
+
+    #[test]
+    fn proportional_labels_use_glyph_widths() {
+        let ctx = test_context();
+        let style = LabelStyle::default();
+
+        assert!(style.text_size(&ctx, "WWWW").x > style.text_size(&ctx, "iiii").x);
+    }
+
+    #[test]
+    fn terminal_labels_stay_on_the_resistor_axis() {
+        let ctx = test_context();
+        let elements = [Element::Resistor(
+            egui::pos2(0.0, 20.0),
+            egui::pos2(100.0, 20.0),
+        )];
+        let labels = [NodeLabel {
+            position: egui::pos2(0.0, 20.0),
+            text: String::from("A"),
+        }];
+
+        let placement = terminal_placements(
+            &ctx,
+            &elements,
+            &labels,
+            &[],
+            LabelStyle::default(),
+        )[0]
+            .unwrap();
+
+        assert_eq!(placement.rect.center().y, 20.0);
+        assert!(placement.rect.right() < 0.0);
+    }
 }

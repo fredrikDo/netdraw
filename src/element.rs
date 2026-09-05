@@ -64,6 +64,8 @@ pub struct DraggedEndpoint {
 
 // Handles are drawn at this radius; their larger hit area makes them easier to grab.
 pub const ENDPOINT_RADIUS: f32 = 8.0;
+// Keep terminal ticks identical in the interactive canvas and exported SVG.
+pub const RESISTOR_TERMINAL_LENGTH: f32 = 20.0;
 // Endpoints within this distance are joined to make circuit connections easy to align.
 const SNAP_DISTANCE: f32 = 12.0;
 const ERASE_DISTANCE: f32 = 10.0;
