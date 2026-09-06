@@ -3,8 +3,9 @@ use std::path::Path;
 
 use crate::{
     element::{
-        element_at, endpoint_at, junction_positions, overlapping_endpoints, snap_to_endpoint,
-        unconnected_resistor_terminal_positions, DraggedEndpoint, DrawMode, Element,
+        element_at, endpoint_at, endpoints_in_rect, junction_positions, overlapping_endpoints,
+        snap_to_endpoint, unconnected_resistor_terminal_positions, DraggedEndpoint, DrawMode,
+        Element, ENDPOINT_RADIUS,
     },
     renderer::{
         draw_element, draw_elements, draw_endpoint_handles, draw_labels,
@@ -15,6 +16,7 @@ use crate::{
 };
 
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
+const CANVAS_BACKGROUND: egui::Color32 = egui::Color32::WHITE;
 const TOOL_BUTTON_SIZE: f32 = 36.0;
 
 #[derive(Clone, Copy)]
@@ -22,6 +24,8 @@ enum ToolIcon {
     Line,
     Resistor,
     PrescribedFlow,
+    Select,
+    Label,
     Move,
     Erase,
     Typography,
@@ -46,12 +50,17 @@ struct Canvas {
     start: Option<egui::Pos2>,
     // Set while moving one or more connected endpoints of completed elements.
     dragged_endpoints: Vec<DraggedEndpoint>,
+    dragged_endpoint_origins: Vec<egui::Pos2>,
+    drag_origin: Option<egui::Pos2>,
+    selected_endpoints: Vec<DraggedEndpoint>,
+    selection_start: Option<egui::Pos2>,
     draw_mode: DrawMode,
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
     label_style_dialog_open: bool,
     label_style: crate::label::LabelStyle,
+    fonts_installed: bool,
     editing_label: Option<EditingLabel>,
 }
 
@@ -71,12 +80,17 @@ impl Default for Canvas {
             terminal_labels: Vec::new(),
             start: None,
             dragged_endpoints: Vec::new(),
-            draw_mode: DrawMode::Line,
+            dragged_endpoint_origins: Vec::new(),
+            drag_origin: None,
+            selected_endpoints: Vec::new(),
+            selection_start: None,
+            draw_mode: DrawMode::Select,
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
             export_status: None,
             label_style_dialog_open: false,
             label_style: crate::label::LabelStyle::default(),
+            fonts_installed: false,
             editing_label: None,
         }
     }
@@ -84,6 +98,11 @@ impl Default for Canvas {
 
 impl Canvas {
     fn show(&mut self, ui: &mut egui::Ui) {
+        Self::apply_button_colors(ui);
+        if !self.fonts_installed {
+            crate::label::install_fonts(ui.ctx());
+            self.fonts_installed = true;
+        }
         self.show_menu_bar(ui);
         self.show_toolbar(ui);
         self.show_export_dialog(ui.ctx());
@@ -94,14 +113,29 @@ impl Canvas {
             .show(ui, |ui| self.show_canvas(ui));
     }
 
+    fn apply_button_colors(ui: &mut egui::Ui) {
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        for visuals in [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
+        ] {
+            visuals.weak_bg_fill = egui::Color32::BLACK;
+            visuals.fg_stroke.color = egui::Color32::WHITE;
+        }
+    }
+
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(CANVAS_SIZE, egui::Sense::click_and_drag());
-        painter.rect_filled(response.rect, 0.0, egui::Color32::WHITE);
+        painter.rect_filled(response.rect, 0.0, CANVAS_BACKGROUND);
         let origin = response.rect.min.to_vec2();
         let pointer_position = response
             .interact_pointer_pos()
             .map(|position| position - origin);
 
+        self.handle_selection(&response, pointer_position);
+        self.handle_selected_delete(ui);
         self.handle_erase(&response, pointer_position);
         self.handle_label_click(&response, pointer_position);
         self.handle_drag(&response, pointer_position);
@@ -117,6 +151,7 @@ impl Canvas {
         draw_endpoint_handles(&painter, &screen_elements, response.hover_pos());
         draw_resistor_junction_nodes(&painter, &screen_elements);
         draw_prescribed_flow_junction_nodes(&painter, &screen_elements);
+        self.draw_selection(&painter, pointer_position, origin);
         // An empty label still needs a temporary location while its editor is open.
         let mut layout_labels = self.labels.clone();
         if let Some(EditingLabel::Element(index)) = self.editing_label
@@ -347,21 +382,15 @@ impl Canvas {
                     .show(ui, |ui| {
                         ui.label("Font");
                         egui::ComboBox::from_id_salt("label_font")
-                            .selected_text(match self.label_style.font {
-                                crate::label::LabelFont::Proportional => "Proportional",
-                                crate::label::LabelFont::Monospace => "Monospace",
-                            })
+                            .selected_text(self.label_style.font.display_name())
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.label_style.font,
-                                    crate::label::LabelFont::Proportional,
-                                    "Proportional",
-                                );
-                                ui.selectable_value(
-                                    &mut self.label_style.font,
-                                    crate::label::LabelFont::Monospace,
-                                    "Monospace",
-                                );
+                                for font in crate::label::LabelFont::ALL {
+                                    ui.selectable_value(
+                                        &mut self.label_style.font,
+                                        font,
+                                        font.display_name(),
+                                    );
+                                }
                             });
                         ui.end_row();
 
@@ -401,6 +430,8 @@ impl Canvas {
                 "Prescribed flow",
             );
             ui.separator();
+            self.select_mode(ui, DrawMode::Select, ToolIcon::Select, "Select endpoints");
+            self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
             self.select_mode(ui, DrawMode::Move, ToolIcon::Move, "Move");
             ui.separator();
             self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
@@ -412,6 +443,10 @@ impl Canvas {
                 self.terminal_labels.clear();
                 self.start = None;
                 self.dragged_endpoints.clear();
+                self.dragged_endpoint_origins.clear();
+                self.drag_origin = None;
+                self.selected_endpoints.clear();
+                self.selection_start = None;
                 self.editing_label = None;
             }
             ui.separator();
@@ -442,6 +477,7 @@ impl Canvas {
         let response = ui.add(
             egui::Button::new("")
                 .selected(selected)
+                .fill(egui::Color32::BLACK)
                 .min_size(egui::Vec2::splat(TOOL_BUTTON_SIZE)),
         );
         response.widget_info(|| {
@@ -453,7 +489,7 @@ impl Canvas {
             )
         });
 
-        let color = ui.style().interact(&response).fg_stroke.color;
+        let color = egui::Color32::WHITE;
         Self::paint_tool_icon(ui.painter(), response.rect.shrink(7.0), icon, color);
         response.on_hover_text(label)
     }
@@ -508,6 +544,32 @@ impl Canvas {
                 painter.line_segment(
                     [arrow_tip, arrow_tip + egui::vec2(-3.5, 3.0)],
                     stroke,
+                );
+            }
+            ToolIcon::Select => {
+                let tip = rect.left_top() + egui::vec2(3.0, 2.0);
+                let points = [
+                    tip,
+                    tip + egui::vec2(4.0, 17.0),
+                    tip + egui::vec2(7.0, 11.0),
+                    tip + egui::vec2(12.0, 17.0),
+                    tip + egui::vec2(15.0, 14.0),
+                    tip + egui::vec2(10.0, 9.0),
+                    tip + egui::vec2(17.0, 7.0),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    points.to_vec(),
+                    color,
+                    egui::Stroke::new(1.0, egui::Color32::BLACK),
+                ));
+            }
+            ToolIcon::Label => {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "T",
+                    egui::FontId::proportional(20.0),
+                    color,
                 );
             }
             ToolIcon::Move => {
@@ -604,11 +666,115 @@ impl Canvas {
         }
     }
 
+    fn handle_selection(
+        &mut self,
+        response: &egui::Response,
+        pointer_position: Option<egui::Pos2>,
+    ) {
+        if self.draw_mode != DrawMode::Select {
+            self.selection_start = None;
+            return;
+        }
+
+        if response.is_pointer_button_down_on() && self.selection_start.is_none() {
+            self.selection_start = pointer_position;
+            self.selected_endpoints.clear();
+            self.editing_label = None;
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(end)) = (self.selection_start.take(), pointer_position) {
+                let selection = egui::Rect::from_two_pos(start, end);
+                self.selected_endpoints = endpoints_in_rect(&self.elements, selection);
+            }
+        } else if response.clicked() {
+            self.selection_start = None;
+            self.selected_endpoints = pointer_position
+                .and_then(|position| endpoint_at(&self.elements, position))
+                .map(|endpoint| overlapping_endpoints(&self.elements, endpoint))
+                .unwrap_or_default();
+        }
+    }
+
+    fn handle_selected_delete(&mut self, ui: &egui::Ui) {
+        if self.selected_endpoints.is_empty()
+            || self.editing_label.is_some()
+            || ui.ctx().egui_wants_keyboard_input()
+            || !ui.input(|input| {
+                input.key_pressed(egui::Key::Delete)
+                    || input.key_pressed(egui::Key::Backspace)
+            })
+        {
+            return;
+        }
+
+        self.delete_selected_elements();
+    }
+
+    fn delete_selected_elements(&mut self) {
+        let mut indices: Vec<_> = self
+            .selected_endpoints
+            .iter()
+            .map(|endpoint| endpoint.element_index)
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        for index in indices.into_iter().rev() {
+            self.elements.remove(index);
+            self.labels.remove(index);
+        }
+        self.selected_endpoints.clear();
+        self.dragged_endpoints.clear();
+        self.dragged_endpoint_origins.clear();
+        self.drag_origin = None;
+        let junctions = junction_positions(&self.elements);
+        self.node_labels
+            .retain(|label| junctions.contains(&label.position));
+        let terminals = unconnected_resistor_terminal_positions(&self.elements);
+        self.terminal_labels
+            .retain(|label| terminals.contains(&label.position));
+    }
+
+    fn draw_selection(
+        &self,
+        painter: &egui::Painter,
+        pointer_position: Option<egui::Pos2>,
+        origin: egui::Vec2,
+    ) {
+        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 110, 220));
+        for endpoint in &self.selected_endpoints {
+            let Some(element) = self.elements.get(endpoint.element_index) else {
+                continue;
+            };
+            let (start, end) = element.endpoints();
+            let position = if endpoint.is_start { start } else { end };
+            painter.circle_stroke(position + origin, ENDPOINT_RADIUS + 2.0, stroke);
+        }
+
+        if self.draw_mode == DrawMode::Select
+            && let (Some(start), Some(end)) = (self.selection_start, pointer_position)
+        {
+            paint_dashed_rect(
+                painter,
+                egui::Rect::from_two_pos(start + origin, end + origin),
+                stroke,
+            );
+        }
+    }
+
     fn handle_erase(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         // In erase mode, remove the topmost element under a canvas click.
         if self.draw_mode == DrawMode::Erase && response.clicked() {
             if let Some(position) = pointer_position {
                 if let Some(element_index) = element_at(&self.elements, position) {
+                    if self
+                        .selected_endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.element_index == element_index)
+                    {
+                        self.delete_selected_elements();
+                        return;
+                    }
+                    self.selected_endpoints.clear();
                     self.elements.remove(element_index);
                     self.labels.remove(element_index);
                     self.editing_label = self.editing_label.and_then(|editing_index| {
@@ -636,7 +802,7 @@ impl Canvas {
         response: &egui::Response,
         pointer_position: Option<egui::Pos2>,
     ) {
-        if self.draw_mode != DrawMode::Erase && response.clicked() {
+        if self.draw_mode == DrawMode::Label && response.clicked() {
             self.editing_label = pointer_position.and_then(|position| {
                 let junctions = junction_positions(&self.elements);
                 let terminals = unconnected_resistor_terminal_positions(&self.elements);
@@ -708,15 +874,39 @@ impl Canvas {
             .order(egui::Order::Foreground)
             .fixed_pos(placement.rect.left_top())
             .show(ui.ctx(), |ui| {
-                let response = ui.add_sized(
-                    placement.rect.size(),
-                    egui::TextEdit::singleline(match editing {
-                        EditingLabel::Element(_) => &mut self.labels[index],
-                        EditingLabel::Node(_) => &mut self.node_labels[index].text,
-                        EditingLabel::Terminal(_) => &mut self.terminal_labels[index].text,
+                let label = match editing {
+                    EditingLabel::Element(_) => &mut self.labels[index],
+                    EditingLabel::Node(_) => &mut self.node_labels[index].text,
+                    EditingLabel::Terminal(_) => &mut self.terminal_labels[index].text,
+                };
+                let response = ui
+                    .horizontal(|ui| {
+                        let response = ui.add_sized(
+                            placement.rect.size(),
+                            egui::TextEdit::singleline(&mut *label)
+                                .font(self.label_style.font_id())
+                                .text_color(egui::Color32::BLACK)
+                                .background_color(CANVAS_BACKGROUND),
+                        );
+                        if ui
+                            .small_button("x₂")
+                            .on_hover_text("Insert subscript marker (_)")
+                            .clicked()
+                        {
+                            label.push('_');
+                            response.request_focus();
+                        }
+                        if ui
+                            .small_button("x²")
+                            .on_hover_text("Insert superscript marker (^)")
+                            .clicked()
+                        {
+                            label.push('^');
+                            response.request_focus();
+                        }
+                        response
                     })
-                    .font(self.label_style.font_id()),
-                );
+                    .inner;
                 finish_editing = response.has_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 if !finish_editing {
@@ -740,7 +930,7 @@ impl Canvas {
                     }
                     // The arrow starts at its tail, which is intentionally not a snapping end.
                     DrawMode::PrescribedFlow => self.start = Some(position),
-                    DrawMode::Move | DrawMode::Erase => {}
+                    DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
                 }
             }
         }
@@ -749,13 +939,38 @@ impl Canvas {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
                     DrawMode::Move => {
-                        self.dragged_endpoints = endpoint_at(&self.elements, position)
-                            .map(|endpoint| overlapping_endpoints(&self.elements, endpoint))
-                            .unwrap_or_default();
+                        if let Some(endpoint) = endpoint_at(&self.elements, position) {
+                            if self.selected_endpoints.contains(&endpoint) {
+                                self.dragged_endpoints = self.selected_endpoints.clone();
+                                if let Some(anchor_index) = self
+                                    .dragged_endpoints
+                                    .iter()
+                                    .position(|selected| *selected == endpoint)
+                                {
+                                    self.dragged_endpoints.swap(0, anchor_index);
+                                }
+                            } else {
+                                self.selected_endpoints.clear();
+                                self.dragged_endpoints =
+                                    overlapping_endpoints(&self.elements, endpoint);
+                            }
+                            self.dragged_endpoint_origins = self
+                                .dragged_endpoints
+                                .iter()
+                                .map(|endpoint| {
+                                    let (start, end) =
+                                        self.elements[endpoint.element_index].endpoints();
+                                    if endpoint.is_start { start } else { end }
+                                })
+                                .collect();
+                            self.drag_origin = Some(position);
+                        }
                     }
                     DrawMode::Line
                     | DrawMode::Resistor
                     | DrawMode::PrescribedFlow
+                    | DrawMode::Select
+                    | DrawMode::Label
                     | DrawMode::Erase => {}
                 }
             }
@@ -768,9 +983,23 @@ impl Canvas {
             let can_snap = self.dragged_endpoints.iter().all(|endpoint| {
                 self.elements[endpoint.element_index].endpoint_can_snap(endpoint.is_start)
             });
-            let snapped_position = can_snap
-                .then(|| snap_to_endpoint(&self.elements, position, &self.dragged_endpoints))
+            let pointer_delta = position - self.drag_origin.unwrap_or(position);
+            let anchor_origin = self
+                .dragged_endpoint_origins
+                .first()
+                .copied()
                 .unwrap_or(position);
+            let unsnapped_anchor = anchor_origin + pointer_delta;
+            let target_anchor = can_snap
+                .then(|| {
+                    snap_to_endpoint(
+                        &self.elements,
+                        unsnapped_anchor,
+                        &self.dragged_endpoints,
+                    )
+                })
+                .unwrap_or(unsnapped_anchor);
+            let delta = target_anchor - anchor_origin;
             let previous_positions: Vec<_> = self
                 .dragged_endpoints
                 .iter()
@@ -779,13 +1008,23 @@ impl Canvas {
                     if endpoint.is_start { start } else { end }
                 })
                 .collect();
-            for endpoint in &self.dragged_endpoints {
+            let new_positions: Vec<_> = self
+                .dragged_endpoint_origins
+                .iter()
+                .map(|position| *position + delta)
+                .collect();
+            for (endpoint, new_position) in self.dragged_endpoints.iter().zip(&new_positions) {
                 self.elements[endpoint.element_index]
-                    .move_endpoint(endpoint.is_start, snapped_position);
+                    .move_endpoint(endpoint.is_start, *new_position);
             }
-            for node_label in &mut self.node_labels {
-                if previous_positions.contains(&node_label.position) {
-                    node_label.position = snapped_position;
+            for labels in [&mut self.node_labels, &mut self.terminal_labels] {
+                for label in labels {
+                    if let Some(index) = previous_positions
+                        .iter()
+                        .position(|position| *position == label.position)
+                    {
+                        label.position = new_positions[index];
+                    }
                 }
             }
             let junctions = junction_positions(&self.elements);
@@ -813,7 +1052,7 @@ impl Canvas {
                 DrawMode::PrescribedFlow => {
                     draw_element(painter, Element::PrescribedFlow(start, end).translated(origin))
                 }
-                DrawMode::Move | DrawMode::Erase => {}
+                DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
             }
         }
     }
@@ -829,6 +1068,8 @@ impl Canvas {
         }
 
         if !std::mem::take(&mut self.dragged_endpoints).is_empty() {
+            self.dragged_endpoint_origins.clear();
+            self.drag_origin = None;
             // Moving an endpoint never creates an additional element on release.
             return;
         }
@@ -841,7 +1082,7 @@ impl Canvas {
                 DrawMode::PrescribedFlow => {
                     self.elements.push(Element::PrescribedFlow(start, end))
                 }
-                DrawMode::Move | DrawMode::Erase => {}
+                DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
             }
             if matches!(
                 self.draw_mode,
@@ -852,5 +1093,30 @@ impl Canvas {
         }
 
         self.start = None;
+    }
+}
+
+fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
+    for (start, end) in [
+        (rect.left_top(), rect.right_top()),
+        (rect.right_top(), rect.right_bottom()),
+        (rect.right_bottom(), rect.left_bottom()),
+        (rect.left_bottom(), rect.left_top()),
+    ] {
+        let offset = end - start;
+        let length = offset.length();
+        if length == 0.0 {
+            continue;
+        }
+        let direction = offset / length;
+        let mut distance = 0.0;
+        while distance < length {
+            let dash_end = (distance + 6.0).min(length);
+            painter.line_segment(
+                [start + direction * distance, start + direction * dash_end],
+                stroke,
+            );
+            distance += 10.0;
+        }
     }
 }

@@ -42,6 +42,16 @@ pub fn svg(
         bounds.width(), bounds.height(), bounds.width(), bounds.height()
     )
     .unwrap();
+    let (mime_type, font_format) = label_style.font.svg_format();
+    writeln!(
+        output,
+        "  <style>@font-face {{ font-family: '{}'; src: url('data:{};base64,{}') format('{}'); }}</style>",
+        label_style.svg_family(),
+        mime_type,
+        encode_base64(label_style.font.bytes()),
+        font_format,
+    )
+    .unwrap();
     writeln!(output, r#"  <rect width="100%" height="100%" fill="white"/>"#).unwrap();
     writeln!(
         output,
@@ -65,44 +75,17 @@ pub fn svg(
     writeln!(output, "  </g>").unwrap();
     for (label, placement) in labels.iter().zip(&label_placements) {
         if let Some(placement) = placement {
-            writeln!(
-                output,
-                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
-                placement.rect.left(),
-                placement.rect.top() + label_style.size,
-                label_style.svg_family(),
-                label_style.size,
-                escape_xml(label)
-            )
-            .unwrap();
+            svg_label(&mut output, label, *placement, label_style);
         }
     }
     for (node_label, placement) in node_labels.iter().zip(&node_label_placements) {
         if let Some(placement) = placement {
-            writeln!(
-                output,
-                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
-                placement.rect.left(),
-                placement.rect.top() + label_style.size,
-                label_style.svg_family(),
-                label_style.size,
-                escape_xml(&node_label.text)
-            )
-            .unwrap();
+            svg_label(&mut output, &node_label.text, *placement, label_style);
         }
     }
     for (terminal_label, placement) in terminal_labels.iter().zip(&terminal_label_placements) {
         if let Some(placement) = placement {
-            writeln!(
-                output,
-                r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">{}</text>"#,
-                placement.rect.left(),
-                placement.rect.top() + label_style.size,
-                label_style.svg_family(),
-                label_style.size,
-                escape_xml(&terminal_label.text)
-            )
-            .unwrap();
+            svg_label(&mut output, &terminal_label.text, *placement, label_style);
         }
     }
     writeln!(output, "  </g>").unwrap();
@@ -292,6 +275,63 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn svg_label(
+    output: &mut String,
+    text: &str,
+    placement: label::Placement,
+    style: label::LabelStyle,
+) {
+    write!(
+        output,
+        r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">"#,
+        placement.rect.left(),
+        placement.rect.top() + style.size,
+        style.svg_family(),
+        style.size,
+    )
+    .unwrap();
+    for span in label::parse_label(text) {
+        let (font_size, baseline_shift) = match span.position {
+            label::ScriptPosition::Normal => ("100%", "baseline"),
+            label::ScriptPosition::Subscript => ("70%", "sub"),
+            label::ScriptPosition::Superscript => ("70%", "super"),
+        };
+        write!(
+            output,
+            r#"<tspan font-size="{}" baseline-shift="{}">{}</tspan>"#,
+            font_size,
+            baseline_shift,
+            escape_xml(&span.text),
+        )
+        .unwrap();
+    }
+    writeln!(output, "</text>").unwrap();
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
 fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
     let all_endpoints: Vec<_> = elements
         .iter()
@@ -448,6 +488,7 @@ mod tests {
 
     fn test_context() -> egui::Context {
         let ctx = egui::Context::default();
+        label::install_fonts(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
         output.textures_delta.clear();
         ctx
@@ -510,12 +551,41 @@ mod tests {
             &[],
             &[],
             label::LabelStyle {
-                font: label::LabelFont::Monospace,
+                font: label::LabelFont::FiraMono,
                 size: 22.0,
             },
         );
 
-        assert!(document.contains(r#"font-family="monospace""#));
+        assert!(document.contains(r#"font-family="NetDraw Fira Mono""#));
         assert!(document.contains(r#"font-size="22""#));
+        assert!(document.contains("data:font/ttf;base64,"));
+    }
+
+    #[test]
+    fn base64_encoder_handles_padding() {
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn exports_subscripts_and_superscripts() {
+        let elements = [Element::Line(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
+        let ctx = test_context();
+        let document = svg(
+            &ctx,
+            &elements,
+            &[String::from("R_(load)^2")],
+            &[],
+            &[],
+            label::LabelStyle::default(),
+        );
+
+        assert!(document.contains(r#"baseline-shift="sub">load</tspan>"#));
+        assert!(document.contains(r#"baseline-shift="super">2</tspan>"#));
+        assert!(!document.contains("R_(load)^2"));
     }
 }

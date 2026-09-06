@@ -52,11 +52,13 @@ pub enum DrawMode {
     Line,
     Resistor,
     PrescribedFlow,
+    Select,
+    Label,
     Move,
     Erase,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraggedEndpoint {
     pub element_index: usize,
     pub is_start: bool,
@@ -110,6 +112,24 @@ pub fn overlapping_endpoints(
                 .into_iter()
                 .filter_map(move |(is_start, endpoint)| {
                     (endpoint == selected_position).then_some(DraggedEndpoint {
+                        element_index,
+                        is_start,
+                    })
+                })
+        })
+        .collect()
+}
+
+pub fn endpoints_in_rect(elements: &[Element], rect: egui::Rect) -> Vec<DraggedEndpoint> {
+    elements
+        .iter()
+        .enumerate()
+        .flat_map(|(element_index, element)| {
+            let (start, end) = element.endpoints();
+            [(true, start), (false, end)]
+                .into_iter()
+                .filter_map(move |(is_start, endpoint)| {
+                    rect.contains(endpoint).then_some(DraggedEndpoint {
                         element_index,
                         is_start,
                     })
@@ -226,4 +246,36 @@ fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) ->
 
     let position_on_segment = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
     point.distance(start + segment * position_on_segment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_selection_returns_every_enclosed_endpoint() {
+        let elements = [
+            Element::Line(egui::pos2(10.0, 10.0), egui::pos2(100.0, 100.0)),
+            Element::Resistor(egui::pos2(20.0, 20.0), egui::pos2(120.0, 120.0)),
+        ];
+
+        let selected = endpoints_in_rect(
+            &elements,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(30.0, 30.0)),
+        );
+
+        assert_eq!(
+            selected,
+            [
+                DraggedEndpoint {
+                    element_index: 0,
+                    is_start: true,
+                },
+                DraggedEndpoint {
+                    element_index: 1,
+                    is_start: true,
+                },
+            ]
+        );
+    }
 }

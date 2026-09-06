@@ -26,11 +26,9 @@ pub fn draw_labels(
             continue;
         }
         if let Some(placement) = placement {
-            painter.text(
+            painter.galley(
                 placement.rect.left_top(),
-                egui::Align2::LEFT_TOP,
-                label,
-                style.font_id(),
+                style.galley(painter.ctx(), label),
                 egui::Color32::BLACK,
             );
         }

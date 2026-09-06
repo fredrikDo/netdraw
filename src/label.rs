@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::sync::Arc;
 
 use crate::element::Element;
 
@@ -6,8 +7,12 @@ const ELEMENT_CLEARANCE: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelFont {
-    Proportional,
-    Monospace,
+    Inter,
+    NotoSans,
+    Cantarell,
+    Comfortaa,
+    DejaVuSansCondensed,
+    FiraMono,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -16,10 +21,23 @@ pub struct LabelStyle {
     pub size: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptPosition {
+    Normal,
+    Subscript,
+    Superscript,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelSpan {
+    pub text: String,
+    pub position: ScriptPosition,
+}
+
 impl Default for LabelStyle {
     fn default() -> Self {
         Self {
-            font: LabelFont::Proportional,
+            font: LabelFont::Inter,
             size: 18.0,
         }
     }
@@ -27,25 +45,196 @@ impl Default for LabelStyle {
 
 impl LabelStyle {
     pub fn font_id(self) -> egui::FontId {
-        match self.font {
-            LabelFont::Proportional => egui::FontId::proportional(self.size),
-            LabelFont::Monospace => egui::FontId::monospace(self.size),
-        }
+        egui::FontId::new(
+            self.size,
+            egui::FontFamily::Name(self.font.key().into()),
+        )
     }
 
     pub fn svg_family(self) -> &'static str {
-        match self.font {
-            LabelFont::Proportional => "sans-serif",
-            LabelFont::Monospace => "monospace",
-        }
+        self.font.svg_family()
     }
 
     fn text_size(self, ctx: &egui::Context, text: &str) -> egui::Vec2 {
-        let galley = ctx.fonts_mut(|fonts| {
-            fonts.layout_no_wrap(text.to_owned(), self.font_id(), egui::Color32::BLACK)
-        });
-        galley.size() + egui::vec2(4.0, 4.0)
+        self.galley(ctx, text).size() + egui::vec2(4.0, 4.0)
     }
+
+    pub fn galley(self, ctx: &egui::Context, text: &str) -> Arc<egui::Galley> {
+        let mut job = egui::text::LayoutJob::default();
+        for span in parse_label(text) {
+            let (size, valign) = match span.position {
+                ScriptPosition::Normal => (self.size, egui::Align::BOTTOM),
+                ScriptPosition::Subscript => (self.size * 0.7, egui::Align::BOTTOM),
+                ScriptPosition::Superscript => (self.size * 0.7, egui::Align::TOP),
+            };
+            job.append(
+                &span.text,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::new(
+                        size,
+                        egui::FontFamily::Name(self.font.key().into()),
+                    ),
+                    color: egui::Color32::BLACK,
+                    valign,
+                    ..Default::default()
+                },
+            );
+        }
+        ctx.fonts_mut(|fonts| fonts.layout_job(job))
+    }
+}
+
+pub fn parse_label(input: &str) -> Vec<LabelSpan> {
+    let mut spans = Vec::new();
+    let mut normal = String::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((_, character)) = chars.next() {
+        if character == '\\' {
+            normal.push(chars.next().map_or('\\', |(_, escaped)| escaped));
+            continue;
+        }
+        let position = match character {
+            '_' => ScriptPosition::Subscript,
+            '^' => ScriptPosition::Superscript,
+            _ => {
+                normal.push(character);
+                continue;
+            }
+        };
+
+        let Some((_, next)) = chars.next() else {
+            normal.push(character);
+            break;
+        };
+        if !normal.is_empty() {
+            spans.push(LabelSpan {
+                text: std::mem::take(&mut normal),
+                position: ScriptPosition::Normal,
+            });
+        }
+
+        let mut script = String::new();
+        if next == '(' {
+            let mut depth = 1;
+            for (_, grouped) in chars.by_ref() {
+                match grouped {
+                    '(' => {
+                        depth += 1;
+                        script.push(grouped);
+                    }
+                    ')' if depth == 1 => break,
+                    ')' => {
+                        depth -= 1;
+                        script.push(grouped);
+                    }
+                    _ => script.push(grouped),
+                }
+            }
+        } else {
+            script.push(next);
+        }
+        spans.push(LabelSpan {
+            text: script,
+            position,
+        });
+    }
+
+    if !normal.is_empty() {
+        spans.push(LabelSpan {
+            text: normal,
+            position: ScriptPosition::Normal,
+        });
+    }
+    spans
+}
+
+impl LabelFont {
+    pub const ALL: [Self; 6] = [
+        Self::Inter,
+        Self::NotoSans,
+        Self::Cantarell,
+        Self::Comfortaa,
+        Self::DejaVuSansCondensed,
+        Self::FiraMono,
+    ];
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Inter => "Inter",
+            Self::NotoSans => "Noto Sans",
+            Self::Cantarell => "Cantarell",
+            Self::Comfortaa => "Comfortaa",
+            Self::DejaVuSansCondensed => "DejaVu Sans Condensed",
+            Self::FiraMono => "Fira Mono",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Inter => "netdraw_inter",
+            Self::NotoSans => "netdraw_noto_sans",
+            Self::Cantarell => "netdraw_cantarell",
+            Self::Comfortaa => "netdraw_comfortaa",
+            Self::DejaVuSansCondensed => "netdraw_dejavu_sans_condensed",
+            Self::FiraMono => "netdraw_fira_mono",
+        }
+    }
+
+    fn svg_family(self) -> &'static str {
+        match self {
+            Self::Inter => "NetDraw Inter",
+            Self::NotoSans => "NetDraw Noto Sans",
+            Self::Cantarell => "NetDraw Cantarell",
+            Self::Comfortaa => "NetDraw Comfortaa",
+            Self::DejaVuSansCondensed => "NetDraw DejaVu Sans Condensed",
+            Self::FiraMono => "NetDraw Fira Mono",
+        }
+    }
+
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Inter => include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+            Self::NotoSans => include_bytes!("../assets/fonts/NotoSans-Regular.ttf"),
+            Self::Cantarell => include_bytes!("../assets/fonts/Cantarell-Regular.otf"),
+            Self::Comfortaa => include_bytes!("../assets/fonts/Comfortaa-Regular.otf"),
+            Self::DejaVuSansCondensed => {
+                include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf")
+            }
+            Self::FiraMono => include_bytes!("../assets/fonts/FiraMono-Medium.ttf"),
+        }
+    }
+
+    pub fn svg_format(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Cantarell | Self::Comfortaa => ("font/otf", "opentype"),
+            _ => ("font/ttf", "truetype"),
+        }
+    }
+}
+
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut definitions = egui::FontDefinitions::default();
+    let fallbacks = definitions
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    for font in LabelFont::ALL {
+        definitions.font_data.insert(
+            font.key().to_owned(),
+            Arc::new(egui::FontData::from_static(font.bytes())),
+        );
+        let mut family_fonts = vec![font.key().to_owned()];
+        family_fonts.extend(fallbacks.iter().cloned());
+        definitions.families.insert(
+            egui::FontFamily::Name(font.key().into()),
+            family_fonts,
+        );
+    }
+    ctx.set_fonts(definitions);
 }
 
 #[derive(Clone, Copy)]
@@ -272,6 +461,7 @@ mod tests {
 
     fn test_context() -> egui::Context {
         let ctx = egui::Context::default();
+        install_fonts(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
         output.textures_delta.clear();
         ctx
@@ -283,6 +473,16 @@ mod tests {
         let style = LabelStyle::default();
 
         assert!(style.text_size(&ctx, "WWWW").x > style.text_size(&ctx, "iiii").x);
+    }
+
+    #[test]
+    fn every_bundled_font_is_available() {
+        let ctx = test_context();
+        for font in LabelFont::ALL {
+            let size = LabelStyle { font, size: 18.0 }.text_size(&ctx, "NetDraw");
+            assert!(size.x > 4.0, "{} did not render", font.display_name());
+            assert!(size.y > 4.0, "{} did not render", font.display_name());
+        }
     }
 
     #[test]
@@ -308,5 +508,53 @@ mod tests {
 
         assert_eq!(placement.rect.center().y, 20.0);
         assert!(placement.rect.right() < 0.0);
+    }
+
+    #[test]
+    fn parses_typst_style_scripts_and_groups() {
+        assert_eq!(
+            parse_label("R_1^2 V_(out)^max"),
+            [
+                LabelSpan {
+                    text: String::from("R"),
+                    position: ScriptPosition::Normal,
+                },
+                LabelSpan {
+                    text: String::from("1"),
+                    position: ScriptPosition::Subscript,
+                },
+                LabelSpan {
+                    text: String::from("2"),
+                    position: ScriptPosition::Superscript,
+                },
+                LabelSpan {
+                    text: String::from(" V"),
+                    position: ScriptPosition::Normal,
+                },
+                LabelSpan {
+                    text: String::from("out"),
+                    position: ScriptPosition::Subscript,
+                },
+                LabelSpan {
+                    text: String::from("m"),
+                    position: ScriptPosition::Superscript,
+                },
+                LabelSpan {
+                    text: String::from("ax"),
+                    position: ScriptPosition::Normal,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn backslash_escapes_script_markers() {
+        assert_eq!(
+            parse_label(r"file\_name \^ literal"),
+            [LabelSpan {
+                text: String::from("file_name ^ literal"),
+                position: ScriptPosition::Normal,
+            }]
+        );
     }
 }
