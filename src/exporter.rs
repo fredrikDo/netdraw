@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use eframe::egui;
 
-use crate::element::{Element, RESISTOR_TERMINAL_LENGTH};
+use crate::element::{Element, RESISTOR_TERMINAL_LENGTH, RESISTOR_ZIG_SEGMENTS};
 use crate::label;
 
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
@@ -175,8 +175,9 @@ impl Bounds {
         self.include(end);
         self.include(body_start);
         self.include(body_end);
-        for index in 1..8 {
-            let center = body_start + direction * (body_length * index as f32 / 8.0);
+        for index in 1..RESISTOR_ZIG_SEGMENTS {
+            let center = body_start
+                + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
             let amplitude = if index % 2 == 1 { 8.0 } else { -8.0 };
             self.include(center + perpendicular * amplitude);
         }
@@ -433,8 +434,9 @@ fn resistor(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
     line(output, body_end, end, 1.5);
 
     let mut path = format!("M {} {}", body_start.x, body_start.y);
-    for index in 1..8 {
-        let center = body_start + direction * (body_length * index as f32 / 8.0);
+    for index in 1..RESISTOR_ZIG_SEGMENTS {
+        let center = body_start
+            + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
         let amplitude = if index % 2 == 1 { 8.0 } else { -8.0 };
         let point = center + perpendicular * amplitude;
         write!(path, " L {} {}", point.x, point.y).unwrap();
@@ -587,5 +589,28 @@ mod tests {
         assert!(document.contains(r#"baseline-shift="sub">load</tspan>"#));
         assert!(document.contains(r#"baseline-shift="super">2</tspan>"#));
         assert!(!document.contains("R_(load)^2"));
+    }
+
+    #[test]
+    fn exports_resistor_with_seven_zig_segments() {
+        let elements = [Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
+        let ctx = test_context();
+        let document = svg(
+            &ctx,
+            &elements,
+            &[String::new()],
+            &[],
+            &[],
+            label::LabelStyle::default(),
+        );
+        let resistor_path = document
+            .lines()
+            .find(|line| line.contains("<path"))
+            .unwrap();
+
+        assert_eq!(resistor_path.matches(" L ").count(), 7);
     }
 }

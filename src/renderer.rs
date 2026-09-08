@@ -1,6 +1,8 @@
 use eframe::egui;
 
-use crate::element::{Element, ENDPOINT_RADIUS, RESISTOR_TERMINAL_LENGTH};
+use crate::element::{
+    Element, ENDPOINT_RADIUS, RESISTOR_TERMINAL_LENGTH, RESISTOR_ZIG_SEGMENTS,
+};
 use crate::label::{LabelStyle, Placement};
 
 // Endpoint handles appear only when the pointer is close enough to interact with them.
@@ -169,12 +171,13 @@ pub fn draw_resistor(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2
     painter.line_segment([start, body_start], stroke);
     painter.line_segment([body_end, end], stroke);
 
-    let number_of_zigs = 8;
     let amplitude = 8.0;
-    let mut points = vec![body_start];
+    let mut points = Vec::with_capacity(RESISTOR_ZIG_SEGMENTS + 1);
+    points.push(body_start);
 
-    for i in 1..number_of_zigs {
-        let center = body_start + direction * (body_length * i as f32 / number_of_zigs as f32);
+    for i in 1..RESISTOR_ZIG_SEGMENTS {
+        let center = body_start
+            + direction * (body_length * i as f32 / RESISTOR_ZIG_SEGMENTS as f32);
         let amplitude = if i % 2 == 1 { amplitude } else { -amplitude };
         points.push(center + perpendicular * amplitude);
     }

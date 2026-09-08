@@ -907,7 +907,9 @@ impl Canvas {
                         response
                     })
                     .inner;
-                finish_editing = response.has_focus()
+                // A single-line TextEdit surrenders focus when Enter is pressed, so check
+                // `lost_focus` as well as `has_focus` on the key event's frame.
+                finish_editing = (response.has_focus() || response.lost_focus())
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 if !finish_editing {
                     response.request_focus();
