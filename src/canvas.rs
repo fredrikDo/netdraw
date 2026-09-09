@@ -26,7 +26,6 @@ enum ToolIcon {
     PrescribedFlow,
     Select,
     Label,
-    Move,
     Erase,
     Typography,
     CleanAll,
@@ -54,6 +53,8 @@ struct Canvas {
     drag_origin: Option<egui::Pos2>,
     selected_endpoints: Vec<DraggedEndpoint>,
     selection_start: Option<egui::Pos2>,
+    selection_pointer_down: bool,
+    selection_drag_anchor: Option<DraggedEndpoint>,
     draw_mode: DrawMode,
     export_dialog_open: bool,
     export_path: String,
@@ -84,6 +85,8 @@ impl Default for Canvas {
             drag_origin: None,
             selected_endpoints: Vec::new(),
             selection_start: None,
+            selection_pointer_down: false,
+            selection_drag_anchor: None,
             draw_mode: DrawMode::Select,
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
@@ -432,7 +435,6 @@ impl Canvas {
             ui.separator();
             self.select_mode(ui, DrawMode::Select, ToolIcon::Select, "Select endpoints");
             self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
-            self.select_mode(ui, DrawMode::Move, ToolIcon::Move, "Move");
             ui.separator();
             self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
             // Unlike drawing modes, this performs its action immediately.
@@ -447,6 +449,8 @@ impl Canvas {
                 self.drag_origin = None;
                 self.selected_endpoints.clear();
                 self.selection_start = None;
+                self.selection_pointer_down = false;
+                self.selection_drag_anchor = None;
                 self.editing_label = None;
             }
             ui.separator();
@@ -572,39 +576,6 @@ impl Canvas {
                     color,
                 );
             }
-            ToolIcon::Move => {
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.left(), center.y),
-                        egui::pos2(rect.right(), center.y),
-                    ],
-                    stroke,
-                );
-                painter.line_segment(
-                    [
-                        egui::pos2(center.x, rect.top()),
-                        egui::pos2(center.x, rect.bottom()),
-                    ],
-                    stroke,
-                );
-                for (tip, offset_a, offset_b) in [
-                    (left, egui::vec2(4.0, -3.0), egui::vec2(4.0, 3.0)),
-                    (right, egui::vec2(-4.0, -3.0), egui::vec2(-4.0, 3.0)),
-                    (
-                        egui::pos2(center.x, rect.top()),
-                        egui::vec2(-3.0, 4.0),
-                        egui::vec2(3.0, 4.0),
-                    ),
-                    (
-                        egui::pos2(center.x, rect.bottom()),
-                        egui::vec2(-3.0, -4.0),
-                        egui::vec2(3.0, -4.0),
-                    ),
-                ] {
-                    painter.line_segment([tip, tip + offset_a], stroke);
-                    painter.line_segment([tip, tip + offset_b], stroke);
-                }
-            }
             ToolIcon::Erase => {
                 let points = [
                     center + egui::vec2(-7.0, 4.0),
@@ -673,13 +644,21 @@ impl Canvas {
     ) {
         if self.draw_mode != DrawMode::Select {
             self.selection_start = None;
+            self.selection_pointer_down = false;
+            self.selection_drag_anchor = None;
             return;
         }
 
-        if response.is_pointer_button_down_on() && self.selection_start.is_none() {
-            self.selection_start = pointer_position;
-            self.selected_endpoints.clear();
-            self.editing_label = None;
+        if response.is_pointer_button_down_on() && !self.selection_pointer_down {
+            self.selection_pointer_down = true;
+            self.selection_drag_anchor = pointer_position
+                .and_then(|position| endpoint_at(&self.elements, position))
+                .filter(|endpoint| self.selected_endpoints.contains(endpoint));
+            if self.selection_drag_anchor.is_none() {
+                self.selection_start = pointer_position;
+                self.selected_endpoints.clear();
+                self.editing_label = None;
+            }
         }
         if response.drag_stopped() {
             if let (Some(start), Some(end)) = (self.selection_start.take(), pointer_position) {
@@ -692,6 +671,10 @@ impl Canvas {
                 .and_then(|position| endpoint_at(&self.elements, position))
                 .map(|endpoint| overlapping_endpoints(&self.elements, endpoint))
                 .unwrap_or_default();
+        }
+        if !response.is_pointer_button_down_on() {
+            self.selection_pointer_down = false;
+            self.selection_drag_anchor = None;
         }
     }
 
@@ -893,7 +876,7 @@ impl Canvas {
                             .on_hover_text("Insert subscript marker (_)")
                             .clicked()
                         {
-                            label.push('_');
+                            insert_label_marker(ui.ctx(), response.id, label, '_');
                             response.request_focus();
                         }
                         if ui
@@ -901,7 +884,7 @@ impl Canvas {
                             .on_hover_text("Insert superscript marker (^)")
                             .clicked()
                         {
-                            label.push('^');
+                            insert_label_marker(ui.ctx(), response.id, label, '^');
                             response.request_focus();
                         }
                         response
@@ -932,7 +915,7 @@ impl Canvas {
                     }
                     // The arrow starts at its tail, which is intentionally not a snapping end.
                     DrawMode::PrescribedFlow => self.start = Some(position),
-                    DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
+                    DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
                 }
             }
         }
@@ -940,21 +923,15 @@ impl Canvas {
         if response.drag_started() {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
-                    DrawMode::Move => {
-                        if let Some(endpoint) = endpoint_at(&self.elements, position) {
-                            if self.selected_endpoints.contains(&endpoint) {
-                                self.dragged_endpoints = self.selected_endpoints.clone();
-                                if let Some(anchor_index) = self
-                                    .dragged_endpoints
-                                    .iter()
-                                    .position(|selected| *selected == endpoint)
-                                {
-                                    self.dragged_endpoints.swap(0, anchor_index);
-                                }
-                            } else {
-                                self.selected_endpoints.clear();
-                                self.dragged_endpoints =
-                                    overlapping_endpoints(&self.elements, endpoint);
+                    DrawMode::Select => {
+                        if let Some(endpoint) = self.selection_drag_anchor {
+                            self.dragged_endpoints = self.selected_endpoints.clone();
+                            if let Some(anchor_index) = self
+                                .dragged_endpoints
+                                .iter()
+                                .position(|selected| *selected == endpoint)
+                            {
+                                self.dragged_endpoints.swap(0, anchor_index);
                             }
                             self.dragged_endpoint_origins = self
                                 .dragged_endpoints
@@ -971,7 +948,6 @@ impl Canvas {
                     DrawMode::Line
                     | DrawMode::Resistor
                     | DrawMode::PrescribedFlow
-                    | DrawMode::Select
                     | DrawMode::Label
                     | DrawMode::Erase => {}
                 }
@@ -1054,7 +1030,7 @@ impl Canvas {
                 DrawMode::PrescribedFlow => {
                     draw_element(painter, Element::PrescribedFlow(start, end).translated(origin))
                 }
-                DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
+                DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
             }
         }
     }
@@ -1084,7 +1060,7 @@ impl Canvas {
                 DrawMode::PrescribedFlow => {
                     self.elements.push(Element::PrescribedFlow(start, end))
                 }
-                DrawMode::Select | DrawMode::Label | DrawMode::Move | DrawMode::Erase => {}
+                DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
             }
             if matches!(
                 self.draw_mode,
@@ -1121,4 +1097,28 @@ fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::St
             distance += 10.0;
         }
     }
+}
+
+fn insert_label_marker(ctx: &egui::Context, id: egui::Id, label: &mut String, marker: char) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let fallback = egui::text::CCursor::new(label.chars().count());
+    let [start, end] = state
+        .cursor
+        .char_range()
+        .map(|range| range.sorted_cursors())
+        .unwrap_or([fallback, fallback]);
+    let start_byte = byte_index_at_char(label, start.index.0);
+    let end_byte = byte_index_at_char(label, end.index.0);
+    label.replace_range(start_byte..end_byte, &marker.to_string());
+
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+        egui::text::CCursor::new(start.index.0 + 1),
+    )));
+    egui::TextEdit::store_state(ctx, id, state);
+}
+
+fn byte_index_at_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
 }

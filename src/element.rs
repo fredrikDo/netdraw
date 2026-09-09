@@ -54,7 +54,6 @@ pub enum DrawMode {
     PrescribedFlow,
     Select,
     Label,
-    Move,
     Erase,
 }
 
