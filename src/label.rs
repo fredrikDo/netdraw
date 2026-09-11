@@ -275,7 +275,8 @@ pub fn placements(
         let center = start + offset * 0.5;
 
         let mut placement = None;
-        // Try both sides, increasing the distance until the label clears every element and label.
+        // These are perpendicular distances from the element's midpoint to the label's center.
+        // Start close to the element, then move outward until the label clears the diagram.
         for distance in [32.0, 50.0, 68.0, 86.0, 104.0] {
             for side in [1.0, -1.0] {
                 let rect = egui::Rect::from_center_size(center + perpendicular * distance * side, size);
@@ -320,7 +321,9 @@ pub fn node_placements(
         }
         let size = style.text_size(ctx, &node_label.text);
         let mut placement = None;
-        for distance in [28.0, 46.0, 64.0, 82.0, 100.0] {
+        // These are distances from the junction endpoint to the label's center. At each
+        // distance, try the cardinal and diagonal directions before moving farther away.
+        for distance in [8.0, 16.0, 28.0, 46.0, 64.0, 82.0, 100.0] {
             for offset in [
                 egui::Vec2::Y,
                 -egui::Vec2::Y,
@@ -374,6 +377,9 @@ pub fn terminal_placements(
             continue;
         };
         let size = style.text_size(ctx, &terminal_label.text);
+        // Project half of the axis-aligned label rectangle onto the resistor direction. Adding
+        // this radius means `clearance` below measures from the endpoint to the label's nearest
+        // edge, rather than from the endpoint to the label's center.
         let inline_radius =
             direction.x.abs() * size.x * 0.5 + direction.y.abs() * size.y * 0.5;
         let candidate = |clearance| {
@@ -382,7 +388,9 @@ pub fn terminal_placements(
                 size,
             )
         };
-        let rect = [8.0, 26.0, 44.0, 62.0, 80.0]
+        // Keep terminal labels inline with the resistor. The normal edge-to-endpoint gap is
+        // 8 px; if that collides, try progressively larger gaps along the same axis.
+        let rect = [8.0, 16.0, 26.0, 44.0, 62.0, 80.0]
             .into_iter()
             .map(candidate)
             .find(|rect| {
