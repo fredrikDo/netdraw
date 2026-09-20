@@ -67,3 +67,7 @@ cargo test
 ```
 
 The application is built with [egui/eframe](https://github.com/emilk/egui) and uses [rfd](https://github.com/PolyMeilex/rfd) for native file dialogs.
+
+## License
+
+NetDraw is free and open-source software released under the [MIT License](LICENSE).
