@@ -1,18 +1,19 @@
 use eframe::egui;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
+    document::Drawing,
     element::{
-        element_at, endpoint_at, endpoints_in_rect, junction_positions, overlapping_endpoints,
-        snap_to_endpoint, unconnected_resistor_terminal_positions, DraggedEndpoint, DrawMode,
-        Element, ENDPOINT_RADIUS,
+        DraggedEndpoint, DrawMode, ENDPOINT_RADIUS, Element, element_at, endpoint_at,
+        endpoints_in_rect, junction_positions, overlapping_endpoints, snap_to_endpoint,
+        unconnected_resistor_terminal_positions,
     },
+    exporter,
     renderer::{
         draw_element, draw_elements, draw_endpoint_handles, draw_labels,
         draw_prescribed_flow_junction_nodes, draw_resistor_junction_nodes,
         draw_unconnected_resistor_terminals,
     },
-    exporter,
 };
 
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
@@ -63,6 +64,18 @@ struct Canvas {
     label_style: crate::label::LabelStyle,
     fonts_installed: bool,
     editing_label: Option<EditingLabel>,
+    current_path: Option<PathBuf>,
+    clean_drawing: Drawing,
+    file_status: Option<String>,
+    pending_file_action: Option<FileAction>,
+    allow_close: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FileAction {
+    New,
+    Open,
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -95,6 +108,11 @@ impl Default for Canvas {
             label_style: crate::label::LabelStyle::default(),
             fonts_installed: false,
             editing_label: None,
+            current_path: None,
+            clean_drawing: Drawing::empty(),
+            file_status: None,
+            pending_file_action: None,
+            allow_close: false,
         }
     }
 }
@@ -106,10 +124,12 @@ impl Canvas {
             crate::label::install_fonts(ui.ctx());
             self.fonts_installed = true;
         }
+        self.handle_window_close(ui.ctx());
         self.show_menu_bar(ui);
         self.show_toolbar(ui);
         self.show_export_dialog(ui.ctx());
         self.show_label_style_dialog(ui.ctx());
+        self.show_unsaved_changes_dialog(ui.ctx());
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -166,7 +186,9 @@ impl Canvas {
             crate::label::placements(ui.ctx(), &self.elements, &layout_labels, self.label_style);
         let mut layout_node_labels = self.node_labels.clone();
         if let Some(EditingLabel::Node(index)) = self.editing_label
-            && layout_node_labels.get(index).is_some_and(|label| label.text.is_empty())
+            && layout_node_labels
+                .get(index)
+                .is_some_and(|label| label.text.is_empty())
         {
             layout_node_labels[index].text = String::from(" ");
         }
@@ -196,21 +218,27 @@ impl Canvas {
         );
         let screen_label_placements: Vec<_> = label_placements
             .iter()
-            .map(|placement| placement.map(|placement| crate::label::Placement {
-                rect: placement.rect.translate(origin),
-            }))
+            .map(|placement| {
+                placement.map(|placement| crate::label::Placement {
+                    rect: placement.rect.translate(origin),
+                })
+            })
             .collect();
         let screen_node_label_placements: Vec<_> = node_label_placements
             .iter()
-            .map(|placement| placement.map(|placement| crate::label::Placement {
-                rect: placement.rect.translate(origin),
-            }))
+            .map(|placement| {
+                placement.map(|placement| crate::label::Placement {
+                    rect: placement.rect.translate(origin),
+                })
+            })
             .collect();
         let screen_terminal_label_placements: Vec<_> = terminal_label_placements
             .iter()
-            .map(|placement| placement.map(|placement| crate::label::Placement {
-                rect: placement.rect.translate(origin),
-            }))
+            .map(|placement| {
+                placement.map(|placement| crate::label::Placement {
+                    rect: placement.rect.translate(origin),
+                })
+            })
             .collect();
         draw_labels(
             &painter,
@@ -223,7 +251,11 @@ impl Canvas {
             }),
             self.label_style,
         );
-        let node_label_text: Vec<_> = self.node_labels.iter().map(|label| label.text.clone()).collect();
+        let node_label_text: Vec<_> = self
+            .node_labels
+            .iter()
+            .map(|label| label.text.clone())
+            .collect();
         draw_labels(
             &painter,
             &node_label_text,
@@ -263,13 +295,32 @@ impl Canvas {
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("New").clicked() {
+                    self.request_file_action(FileAction::New, ui.ctx());
+                    ui.close();
+                }
+                if ui.button("Open…").clicked() {
+                    self.request_file_action(FileAction::Open, ui.ctx());
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    self.save();
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    self.save_as();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Export…").clicked() {
                     self.export_dialog_open = true;
                     self.export_status = None;
                     ui.close();
                 }
                 if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_file_action(FileAction::Quit, ui.ctx());
+                    ui.close();
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -278,7 +329,189 @@ impl Canvas {
             ui.menu_button("Help", |ui| {
                 ui.label("Help information will appear here.");
             });
+            ui.separator();
+            let name = self
+                .current_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("Untitled");
+            let marker = if self.is_dirty() { " *" } else { "" };
+            ui.label(format!("{name}{marker}"));
+            if let Some(status) = &self.file_status {
+                ui.label(status);
+            }
         });
+    }
+
+    fn drawing(&self) -> Drawing {
+        Drawing {
+            elements: self.elements.clone(),
+            labels: self.labels.clone(),
+            node_labels: self.node_labels.clone(),
+            terminal_labels: self.terminal_labels.clone(),
+            label_style: self.label_style,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.drawing() != self.clean_drawing
+    }
+
+    fn request_file_action(&mut self, action: FileAction, ctx: &egui::Context) {
+        if self.is_dirty() {
+            self.pending_file_action = Some(action);
+        } else {
+            self.perform_file_action(action, ctx);
+        }
+    }
+
+    fn perform_file_action(&mut self, action: FileAction, ctx: &egui::Context) {
+        match action {
+            FileAction::New => self.new_drawing(),
+            FileAction::Open => self.open(),
+            FileAction::Quit => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn handle_window_close(&mut self, ctx: &egui::Context) {
+        if !self.allow_close
+            && ctx.input(|input| input.viewport().close_requested())
+            && self.is_dirty()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.pending_file_action.is_none() {
+                self.pending_file_action = Some(FileAction::Quit);
+            }
+        }
+    }
+
+    fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_file_action else {
+            return;
+        };
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Save your changes before continuing?");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() && self.save() {
+                        self.pending_file_action = None;
+                        self.perform_file_action(action, ctx);
+                    }
+                    if ui.button("Discard").clicked() {
+                        self.pending_file_action = None;
+                        self.perform_file_action(action, ctx);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_file_action = None;
+                    }
+                });
+            });
+    }
+
+    fn save(&mut self) -> bool {
+        match self.current_path.clone() {
+            Some(path) => self.save_to(path),
+            None => self.save_as(),
+        }
+    }
+
+    fn save_as(&mut self) -> bool {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("NetDraw drawing", &["netdraw"])
+            .set_file_name(
+                self.current_path
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("drawing.netdraw"),
+            );
+        if let Some(parent) = self.current_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return false;
+        };
+        if path.extension().is_none() {
+            path.set_extension("netdraw");
+        }
+        self.save_to(path)
+    }
+
+    fn save_to(&mut self, path: PathBuf) -> bool {
+        let drawing = self.drawing();
+        let result = drawing.to_json().and_then(|json| {
+            let temporary_path = path.with_extension("netdraw.tmp");
+            std::fs::write(&temporary_path, json)
+                .map_err(|error| format!("Could not save drawing: {error}"))?;
+            std::fs::rename(&temporary_path, &path)
+                .map_err(|error| format!("Could not finish saving drawing: {error}"))
+        });
+        match result {
+            Ok(()) => {
+                self.clean_drawing = drawing;
+                self.current_path = Some(path.clone());
+                self.file_status = Some(format!("Saved {}", path.display()));
+                true
+            }
+            Err(error) => {
+                self.file_status = Some(error);
+                false
+            }
+        }
+    }
+
+    fn open(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("NetDraw drawing", &["netdraw"]);
+        if let Some(parent) = self.current_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        let result = std::fs::read_to_string(&path)
+            .map_err(|error| format!("Could not open drawing: {error}"))
+            .and_then(|json| Drawing::from_json(&json));
+        match result {
+            Ok(drawing) => {
+                self.apply_drawing(drawing.clone());
+                self.clean_drawing = drawing;
+                self.current_path = Some(path.clone());
+                self.file_status = Some(format!("Opened {}", path.display()));
+            }
+            Err(error) => self.file_status = Some(error),
+        }
+    }
+
+    fn new_drawing(&mut self) {
+        let drawing = Drawing::empty();
+        self.apply_drawing(drawing.clone());
+        self.clean_drawing = drawing;
+        self.current_path = None;
+        self.file_status = Some(String::from("New drawing"));
+    }
+
+    fn apply_drawing(&mut self, drawing: Drawing) {
+        self.elements = drawing.elements;
+        self.labels = drawing.labels;
+        self.node_labels = drawing.node_labels;
+        self.terminal_labels = drawing.terminal_labels;
+        self.label_style = drawing.label_style;
+        self.start = None;
+        self.dragged_endpoints.clear();
+        self.dragged_endpoint_origins.clear();
+        self.drag_origin = None;
+        self.selected_endpoints.clear();
+        self.selection_start = None;
+        self.selection_pointer_down = false;
+        self.selection_drag_anchor = None;
+        self.editing_label = None;
     }
 
     fn show_export_dialog(&mut self, ctx: &egui::Context) {
@@ -333,7 +566,8 @@ impl Canvas {
                                     close_dialog = true;
                                 }
                                 Err(error) => {
-                                    self.export_status = Some(format!("Could not save SVG: {error}"));
+                                    self.export_status =
+                                        Some(format!("Could not save SVG: {error}"));
                                 }
                             }
                         }
@@ -359,7 +593,10 @@ impl Canvas {
                     .unwrap_or("canvas.svg"),
             );
 
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             dialog = dialog.set_directory(parent);
         }
 
@@ -408,10 +645,7 @@ impl Canvas {
                     });
 
                 ui.separator();
-                ui.label(
-                    egui::RichText::new("Label preview")
-                        .font(self.label_style.font_id()),
-                );
+                ui.label(egui::RichText::new("Label preview").font(self.label_style.font_id()));
             });
         self.label_style_dialog_open = open;
     }
@@ -420,12 +654,7 @@ impl Canvas {
         ui.horizontal(|ui| {
             //ui.label("Draw:");
             self.select_mode(ui, DrawMode::Line, ToolIcon::Line, "Line");
-            self.select_mode(
-                ui,
-                DrawMode::Resistor,
-                ToolIcon::Resistor,
-                "Resistance",
-            );
+            self.select_mode(ui, DrawMode::Resistor, ToolIcon::Resistor, "Resistance");
             self.select_mode(
                 ui,
                 DrawMode::PrescribedFlow,
@@ -460,13 +689,7 @@ impl Canvas {
         });
     }
 
-    fn select_mode(
-        &mut self,
-        ui: &mut egui::Ui,
-        mode: DrawMode,
-        icon: ToolIcon,
-        label: &str,
-    ) {
+    fn select_mode(&mut self, ui: &mut egui::Ui, mode: DrawMode, icon: ToolIcon, label: &str) {
         if Self::tool_button(ui, self.draw_mode == mode, icon, label).clicked() {
             self.draw_mode = mode;
         }
@@ -485,12 +708,7 @@ impl Canvas {
                 .min_size(egui::Vec2::splat(TOOL_BUTTON_SIZE)),
         );
         response.widget_info(|| {
-            egui::WidgetInfo::selected(
-                egui::WidgetType::Button,
-                ui.is_enabled(),
-                selected,
-                label,
-            )
+            egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
         });
 
         let color = egui::Color32::WHITE;
@@ -524,7 +742,11 @@ impl Canvas {
                 let mut points = vec![body_left];
                 for index in 1..6 {
                     let fraction = index as f32 / 6.0;
-                    let y = if index % 2 == 1 { -amplitude } else { amplitude };
+                    let y = if index % 2 == 1 {
+                        -amplitude
+                    } else {
+                        amplitude
+                    };
                     points.push(egui::pos2(
                         egui::lerp(body_left.x..=body_right.x, fraction),
                         center.y + y,
@@ -541,14 +763,8 @@ impl Canvas {
                 let arrow_start = center - egui::vec2(radius * 0.55, 0.0);
                 let arrow_tip = center + egui::vec2(radius * 0.55, 0.0);
                 painter.line_segment([arrow_start, arrow_tip], stroke);
-                painter.line_segment(
-                    [arrow_tip, arrow_tip + egui::vec2(-3.5, -3.0)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [arrow_tip, arrow_tip + egui::vec2(-3.5, 3.0)],
-                    stroke,
-                );
+                painter.line_segment([arrow_tip, arrow_tip + egui::vec2(-3.5, -3.0)], stroke);
+                painter.line_segment([arrow_tip, arrow_tip + egui::vec2(-3.5, 3.0)], stroke);
             }
             ToolIcon::Select => {
                 let tip = rect.left_top() + egui::vec2(3.0, 2.0);
@@ -683,8 +899,7 @@ impl Canvas {
             || self.editing_label.is_some()
             || ui.ctx().egui_wants_keyboard_input()
             || !ui.input(|input| {
-                input.key_pressed(egui::Key::Delete)
-                    || input.key_pressed(egui::Key::Backspace)
+                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
             })
         {
             return;
@@ -760,18 +975,21 @@ impl Canvas {
                     self.selected_endpoints.clear();
                     self.elements.remove(element_index);
                     self.labels.remove(element_index);
-                    self.editing_label = self.editing_label.and_then(|editing_index| {
-                        match editing_index {
-                            EditingLabel::Element(index) if index == element_index => None,
-                            EditingLabel::Element(index) => Some(EditingLabel::Element(
-                                index - usize::from(index > element_index),
-                            )),
-                            EditingLabel::Node(index) => Some(EditingLabel::Node(index)),
-                            EditingLabel::Terminal(index) => Some(EditingLabel::Terminal(index)),
-                        }
-                    });
+                    self.editing_label =
+                        self.editing_label
+                            .and_then(|editing_index| match editing_index {
+                                EditingLabel::Element(index) if index == element_index => None,
+                                EditingLabel::Element(index) => Some(EditingLabel::Element(
+                                    index - usize::from(index > element_index),
+                                )),
+                                EditingLabel::Node(index) => Some(EditingLabel::Node(index)),
+                                EditingLabel::Terminal(index) => {
+                                    Some(EditingLabel::Terminal(index))
+                                }
+                            });
                     let positions = junction_positions(&self.elements);
-                    self.node_labels.retain(|label| positions.contains(&label.position));
+                    self.node_labels
+                        .retain(|label| positions.contains(&label.position));
                     let terminals = unconnected_resistor_terminal_positions(&self.elements);
                     self.terminal_labels
                         .retain(|label| terminals.contains(&label.position));
@@ -970,11 +1188,7 @@ impl Canvas {
             let unsnapped_anchor = anchor_origin + pointer_delta;
             let target_anchor = can_snap
                 .then(|| {
-                    snap_to_endpoint(
-                        &self.elements,
-                        unsnapped_anchor,
-                        &self.dragged_endpoints,
-                    )
+                    snap_to_endpoint(&self.elements, unsnapped_anchor, &self.dragged_endpoints)
                 })
                 .unwrap_or(unsnapped_anchor);
             let delta = target_anchor - anchor_origin;
@@ -1023,13 +1237,16 @@ impl Canvas {
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = snap_to_endpoint(&self.elements, position, &[]);
             match self.draw_mode {
-                DrawMode::Line => draw_element(painter, Element::Line(start, end).translated(origin)),
+                DrawMode::Line => {
+                    draw_element(painter, Element::Line(start, end).translated(origin))
+                }
                 DrawMode::Resistor => {
                     draw_element(painter, Element::Resistor(start, end).translated(origin))
                 }
-                DrawMode::PrescribedFlow => {
-                    draw_element(painter, Element::PrescribedFlow(start, end).translated(origin))
-                }
+                DrawMode::PrescribedFlow => draw_element(
+                    painter,
+                    Element::PrescribedFlow(start, end).translated(origin),
+                ),
                 DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
             }
         }
@@ -1057,9 +1274,7 @@ impl Canvas {
             match self.draw_mode {
                 DrawMode::Line => self.elements.push(Element::Line(start, end)),
                 DrawMode::Resistor => self.elements.push(Element::Resistor(start, end)),
-                DrawMode::PrescribedFlow => {
-                    self.elements.push(Element::PrescribedFlow(start, end))
-                }
+                DrawMode::PrescribedFlow => self.elements.push(Element::PrescribedFlow(start, end)),
                 DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
             }
             if matches!(
@@ -1111,9 +1326,11 @@ fn insert_label_marker(ctx: &egui::Context, id: egui::Id, label: &mut String, ma
     let end_byte = byte_index_at_char(label, end.index.0);
     label.replace_range(start_byte..end_byte, &marker.to_string());
 
-    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-        egui::text::CCursor::new(start.index.0 + 1),
-    )));
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(start.index.0 + 1),
+        )));
     egui::TextEdit::store_state(ctx, id, state);
 }
 

@@ -15,7 +15,7 @@ pub enum LabelFont {
     FiraMono,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelStyle {
     pub font: LabelFont,
     pub size: f32,
@@ -45,10 +45,7 @@ impl Default for LabelStyle {
 
 impl LabelStyle {
     pub fn font_id(self) -> egui::FontId {
-        egui::FontId::new(
-            self.size,
-            egui::FontFamily::Name(self.font.key().into()),
-        )
+        egui::FontId::new(self.size, egui::FontFamily::Name(self.font.key().into()))
     }
 
     pub fn svg_family(self) -> &'static str {
@@ -229,10 +226,9 @@ pub fn install_fonts(ctx: &egui::Context) {
         );
         let mut family_fonts = vec![font.key().to_owned()];
         family_fonts.extend(fallbacks.iter().cloned());
-        definitions.families.insert(
-            egui::FontFamily::Name(font.key().into()),
-            family_fonts,
-        );
+        definitions
+            .families
+            .insert(egui::FontFamily::Name(font.key().into()), family_fonts);
     }
     ctx.set_fonts(definitions);
 }
@@ -242,7 +238,7 @@ pub struct Placement {
     pub rect: egui::Rect,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeLabel {
     pub position: egui::Pos2,
     pub text: String,
@@ -279,9 +275,13 @@ pub fn placements(
         // Start close to the element, then move outward until the label clears the diagram.
         for distance in [32.0, 50.0, 68.0, 86.0, 104.0] {
             for side in [1.0, -1.0] {
-                let rect = egui::Rect::from_center_size(center + perpendicular * distance * side, size);
+                let rect =
+                    egui::Rect::from_center_size(center + perpendicular * distance * side, size);
                 if elements.iter().all(|other| clears_element(rect, *other))
-                    && placed.iter().flatten().all(|other| !rect.intersects(other.rect))
+                    && placed
+                        .iter()
+                        .flatten()
+                        .all(|other| !rect.intersects(other.rect))
                 {
                     placement = Some(Placement { rect });
                     break;
@@ -332,9 +332,15 @@ pub fn node_placements(
                 egui::vec2(0.7, 0.7),
                 egui::vec2(-0.7, -0.7),
             ] {
-                let rect = egui::Rect::from_center_size(node_label.position + offset * distance, size);
-                if elements.iter().all(|element| clears_element(rect, *element))
-                    && placed.iter().flatten().all(|other| !rect.intersects(other.rect))
+                let rect =
+                    egui::Rect::from_center_size(node_label.position + offset * distance, size);
+                if elements
+                    .iter()
+                    .all(|element| clears_element(rect, *element))
+                    && placed
+                        .iter()
+                        .flatten()
+                        .all(|other| !rect.intersects(other.rect))
                 {
                     placement = Some(Placement { rect });
                     break;
@@ -346,7 +352,10 @@ pub fn node_placements(
         }
         let placement = placement.or_else(|| {
             Some(Placement {
-                rect: egui::Rect::from_center_size(node_label.position + egui::Vec2::Y * 28.0, size),
+                rect: egui::Rect::from_center_size(
+                    node_label.position + egui::Vec2::Y * 28.0,
+                    size,
+                ),
             })
         });
         placed.push(placement);
@@ -380,8 +389,7 @@ pub fn terminal_placements(
         // Project half of the axis-aligned label rectangle onto the resistor direction. Adding
         // this radius means `clearance` below measures from the endpoint to the label's nearest
         // edge, rather than from the endpoint to the label's center.
-        let inline_radius =
-            direction.x.abs() * size.x * 0.5 + direction.y.abs() * size.y * 0.5;
+        let inline_radius = direction.x.abs() * size.x * 0.5 + direction.y.abs() * size.y * 0.5;
         let candidate = |clearance| {
             egui::Rect::from_center_size(
                 terminal_label.position + direction * (inline_radius + clearance),
@@ -394,8 +402,13 @@ pub fn terminal_placements(
             .into_iter()
             .map(candidate)
             .find(|rect| {
-                elements.iter().all(|element| clears_element(*rect, *element))
-                    && placed.iter().flatten().all(|other| !rect.intersects(other.rect))
+                elements
+                    .iter()
+                    .all(|element| clears_element(*rect, *element))
+                    && placed
+                        .iter()
+                        .flatten()
+                        .all(|other| !rect.intersects(other.rect))
             })
             .unwrap_or_else(|| candidate(8.0));
         let placement = Some(Placement { rect });
@@ -505,14 +518,8 @@ mod tests {
             text: String::from("A"),
         }];
 
-        let placement = terminal_placements(
-            &ctx,
-            &elements,
-            &labels,
-            &[],
-            LabelStyle::default(),
-        )[0]
-            .unwrap();
+        let placement =
+            terminal_placements(&ctx, &elements, &labels, &[], LabelStyle::default())[0].unwrap();
 
         assert_eq!(placement.rect.center().y, 20.0);
         assert!(placement.rect.right() < 0.0);

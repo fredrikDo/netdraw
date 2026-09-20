@@ -1,4 +1,5 @@
 mod canvas;
+mod document;
 mod element;
 mod exporter;
 mod label;

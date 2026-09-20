@@ -39,7 +39,10 @@ pub fn svg(
     writeln!(
         output,
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
-        bounds.width(), bounds.height(), bounds.width(), bounds.height()
+        bounds.width(),
+        bounds.height(),
+        bounds.width(),
+        bounds.height()
     )
     .unwrap();
     let (mime_type, font_format) = label_style.font.svg_format();
@@ -52,14 +55,22 @@ pub fn svg(
         font_format,
     )
     .unwrap();
-    writeln!(output, r#"  <rect width="100%" height="100%" fill="white"/>"#).unwrap();
+    writeln!(
+        output,
+        r#"  <rect width="100%" height="100%" fill="white"/>"#
+    )
+    .unwrap();
     writeln!(
         output,
         r#"  <g transform="translate({} {})">"#,
         -bounds.min.x, -bounds.min.y
     )
     .unwrap();
-    writeln!(output, r#"  <g fill="none" stroke="black" stroke-linecap="round">"#).unwrap();
+    writeln!(
+        output,
+        r#"  <g fill="none" stroke="black" stroke-linecap="round">"#
+    )
+    .unwrap();
 
     for element in elements {
         match *element {
@@ -192,7 +203,10 @@ impl Bounds {
 
         self.include(start);
         self.include(end);
-        self.include_circle(start + offset * 0.5, PRESCRIBED_FLOW_RADIUS.min(length / 2.0));
+        self.include_circle(
+            start + offset * 0.5,
+            PRESCRIBED_FLOW_RADIUS.min(length / 2.0),
+        );
     }
 
     fn include_resistor_terminal_ticks(&mut self, elements: &[Element]) {
@@ -310,8 +324,7 @@ fn svg_label(
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = chunk[0];
@@ -435,8 +448,8 @@ fn resistor(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
 
     let mut path = format!("M {} {}", body_start.x, body_start.y);
     for index in 1..RESISTOR_ZIG_SEGMENTS {
-        let center = body_start
-            + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
+        let center =
+            body_start + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
         let amplitude = if index % 2 == 1 { 8.0 } else { -8.0 };
         let point = center + perpendicular * amplitude;
         write!(path, " L {} {}", point.x, point.y).unwrap();
@@ -541,10 +554,7 @@ mod tests {
 
     #[test]
     fn exports_selected_label_typography() {
-        let elements = [Element::Line(
-            egui::pos2(0.0, 0.0),
-            egui::pos2(100.0, 0.0),
-        )];
+        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
         let ctx = test_context();
         let document = svg(
             &ctx,
@@ -572,10 +582,7 @@ mod tests {
 
     #[test]
     fn exports_subscripts_and_superscripts() {
-        let elements = [Element::Line(
-            egui::pos2(0.0, 0.0),
-            egui::pos2(100.0, 0.0),
-        )];
+        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
         let ctx = test_context();
         let document = svg(
             &ctx,

@@ -1,7 +1,7 @@
 use eframe::egui;
 
 // Every completed item on the canvas is stored with its two editable endpoints.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Element {
     Line(egui::Pos2, egui::Pos2),
     Resistor(egui::Pos2, egui::Pos2),
@@ -148,7 +148,9 @@ pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
                 let count = elements
                     .iter()
                     .filter_map(|other| match other {
-                        Element::Resistor(other_start, other_end) => Some([*other_start, *other_end]),
+                        Element::Resistor(other_start, other_end) => {
+                            Some([*other_start, *other_end])
+                        }
                         _ => None,
                     })
                     .flatten()
@@ -188,7 +190,13 @@ pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui
             _ => None,
         })
         .flatten()
-        .filter(|position| all_endpoints.iter().filter(|other| **other == *position).count() == 1)
+        .filter(|position| {
+            all_endpoints
+                .iter()
+                .filter(|other| **other == *position)
+                .count()
+                == 1
+        })
         .collect()
 }
 
@@ -229,10 +237,14 @@ pub fn snap_to_endpoint(
 
 // Finds the topmost element close enough to be erased.
 pub fn element_at(elements: &[Element], position: egui::Pos2) -> Option<usize> {
-    elements.iter().enumerate().rev().find_map(|(index, element)| {
-        let (start, end) = element.endpoints();
-        (distance_to_segment(position, start, end) <= ERASE_DISTANCE).then_some(index)
-    })
+    elements
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, element)| {
+            let (start, end) = element.endpoints();
+            (distance_to_segment(position, start, end) <= ERASE_DISTANCE).then_some(index)
+        })
 }
 
 // Returns the distance from a point to the closest point on a line segment.
