@@ -19,6 +19,9 @@ use crate::{
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
 const CANVAS_BACKGROUND: egui::Color32 = egui::Color32::WHITE;
 const TOOL_BUTTON_SIZE: f32 = 36.0;
+const TOOL_BUTTON_BACKGROUND: egui::Color32 = egui::Color32::BLACK;
+const SELECTED_TOOL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(28, 100, 190);
+const SELECTED_TOOL_BORDER: egui::Color32 = egui::Color32::from_rgb(125, 195, 255);
 
 #[derive(Clone, Copy)]
 enum ToolIcon {
@@ -701,10 +704,21 @@ impl Canvas {
         icon: ToolIcon,
         label: &str,
     ) -> egui::Response {
+        let fill = if selected {
+            SELECTED_TOOL_BACKGROUND
+        } else {
+            TOOL_BUTTON_BACKGROUND
+        };
+        let stroke = if selected {
+            egui::Stroke::new(2.0, SELECTED_TOOL_BORDER)
+        } else {
+            egui::Stroke::NONE
+        };
         let response = ui.add(
             egui::Button::new("")
                 .selected(selected)
-                .fill(egui::Color32::BLACK)
+                .fill(fill)
+                .stroke(stroke)
                 .min_size(egui::Vec2::splat(TOOL_BUTTON_SIZE)),
         );
         response.widget_info(|| {
