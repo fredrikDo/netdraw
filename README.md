@@ -36,6 +36,8 @@ Choose a drawing tool from the toolbar, then drag across the canvas to create an
 
 Use the selection tool to select and move endpoints. Connected endpoints can be moved together, while the label and erase tools let you annotate or remove parts of the drawing.
 
+Drag a selection box around two or more endpoints, then use **Align horizontally** or **Align vertically** in the toolbar. Alignment uses the center of the selection and keeps the endpoints selected.
+
 The **File** menu provides two separate workflows:
 
 - **Save** and **Open** use the editable `.netdraw` project format.

@@ -33,6 +33,8 @@ enum ToolIcon {
     Erase,
     Typography,
     CleanAll,
+    AlignHorizontal,
+    AlignVertical,
 }
 
 pub fn run() -> eframe::Result<()> {
@@ -666,6 +668,18 @@ impl Canvas {
             );
             ui.separator();
             self.select_mode(ui, DrawMode::Select, ToolIcon::Select, "Select endpoints");
+            ui.add_enabled_ui(self.selected_endpoints.len() >= 2, |ui| {
+                if Self::tool_button(ui, false, ToolIcon::AlignHorizontal, "Align horizontally")
+                    .clicked()
+                {
+                    self.align_selected_endpoints(true);
+                }
+                if Self::tool_button(ui, false, ToolIcon::AlignVertical, "Align vertically")
+                    .clicked()
+                {
+                    self.align_selected_endpoints(false);
+                }
+            });
             self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
             ui.separator();
             self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
@@ -742,6 +756,18 @@ impl Canvas {
         let right = egui::pos2(rect.right(), center.y);
 
         match icon {
+            ToolIcon::AlignHorizontal | ToolIcon::AlignVertical => {
+                let horizontal = matches!(icon, ToolIcon::AlignHorizontal);
+                let offset = if horizontal {
+                    egui::vec2(rect.width() * 0.4, 0.0)
+                } else {
+                    egui::vec2(0.0, rect.height() * 0.4)
+                };
+                painter.line_segment([center - offset, center + offset], stroke);
+                for position in [center - offset, center, center + offset] {
+                    painter.circle_filled(position, 2.8, color);
+                }
+            }
             ToolIcon::Line => {
                 painter.line_segment([left, right], stroke);
             }
@@ -865,6 +891,58 @@ impl Canvas {
                 );
             }
         }
+    }
+
+    fn align_selected_endpoints(&mut self, horizontal: bool) {
+        if self.selected_endpoints.len() < 2 {
+            return;
+        }
+        let previous_positions: Vec<_> = self
+            .selected_endpoints
+            .iter()
+            .map(|endpoint| {
+                let (start, end) = self.elements[endpoint.element_index].endpoints();
+                if endpoint.is_start { start } else { end }
+            })
+            .collect();
+        let center = egui::Rect::from_points(&previous_positions).center();
+        let new_positions: Vec<_> = previous_positions
+            .iter()
+            .map(|position| {
+                if horizontal {
+                    egui::pos2(position.x, center.y)
+                } else {
+                    egui::pos2(center.x, position.y)
+                }
+            })
+            .collect();
+        for (endpoint, position) in self.selected_endpoints.iter().zip(&new_positions) {
+            self.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
+        }
+        self.update_endpoint_labels(&previous_positions, &new_positions);
+    }
+
+    fn update_endpoint_labels(
+        &mut self,
+        previous_positions: &[egui::Pos2],
+        new_positions: &[egui::Pos2],
+    ) {
+        for labels in [&mut self.node_labels, &mut self.terminal_labels] {
+            for label in labels {
+                if let Some(index) = previous_positions
+                    .iter()
+                    .position(|position| *position == label.position)
+                {
+                    label.position = new_positions[index];
+                }
+            }
+        }
+        let junctions = junction_positions(&self.elements);
+        self.node_labels
+            .retain(|label| junctions.contains(&label.position));
+        let terminals = unconnected_resistor_terminal_positions(&self.elements);
+        self.terminal_labels
+            .retain(|label| terminals.contains(&label.position));
     }
 
     fn handle_selection(
@@ -1223,22 +1301,7 @@ impl Canvas {
                 self.elements[endpoint.element_index]
                     .move_endpoint(endpoint.is_start, *new_position);
             }
-            for labels in [&mut self.node_labels, &mut self.terminal_labels] {
-                for label in labels {
-                    if let Some(index) = previous_positions
-                        .iter()
-                        .position(|position| *position == label.position)
-                    {
-                        label.position = new_positions[index];
-                    }
-                }
-            }
-            let junctions = junction_positions(&self.elements);
-            self.node_labels
-                .retain(|node_label| junctions.contains(&node_label.position));
-            let terminals = unconnected_resistor_terminal_positions(&self.elements);
-            self.terminal_labels
-                .retain(|terminal_label| terminals.contains(&terminal_label.position));
+            self.update_endpoint_labels(&previous_positions, &new_positions);
         }
     }
 
@@ -1352,4 +1415,78 @@ fn byte_index_at_char(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
         .map_or(text.len(), |(byte_index, _)| byte_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alignment_moves_only_selected_coordinates_and_attached_labels() {
+        for horizontal in [true, false] {
+            let mut canvas = Canvas::default();
+            canvas.elements = vec![
+                Element::Resistor(egui::pos2(10.0, 20.0), egui::pos2(100.0, 100.0)),
+                Element::PrescribedFlow(egui::pos2(200.0, 200.0), egui::pos2(50.0, 80.0)),
+            ];
+            canvas.selected_endpoints = vec![
+                DraggedEndpoint {
+                    element_index: 0,
+                    is_start: true,
+                },
+                DraggedEndpoint {
+                    element_index: 1,
+                    is_start: false,
+                },
+            ];
+            canvas.terminal_labels.push(crate::label::NodeLabel {
+                position: egui::pos2(10.0, 20.0),
+                text: "terminal".into(),
+            });
+            canvas.node_labels.push(crate::label::NodeLabel {
+                position: egui::pos2(50.0, 80.0),
+                text: "node".into(),
+            });
+            let selection = canvas.selected_endpoints.clone();
+            canvas.align_selected_endpoints(horizontal);
+            let expected = if horizontal {
+                [egui::pos2(10.0, 50.0), egui::pos2(50.0, 50.0)]
+            } else {
+                [egui::pos2(30.0, 20.0), egui::pos2(30.0, 80.0)]
+            };
+            assert_eq!(
+                canvas.elements[0].endpoints(),
+                (expected[0], egui::pos2(100.0, 100.0))
+            );
+            assert_eq!(
+                canvas.elements[1].endpoints(),
+                (egui::pos2(200.0, 200.0), expected[1])
+            );
+            assert_eq!(canvas.terminal_labels[0].position, expected[0]);
+            assert_eq!(canvas.node_labels[0].position, expected[1]);
+            assert_eq!(canvas.selected_endpoints, selection);
+        }
+    }
+
+    #[test]
+    fn alignment_requires_at_least_two_endpoints() {
+        let mut canvas = Canvas::default();
+        canvas.elements.push(Element::Line(
+            egui::pos2(10.0, 20.0),
+            egui::pos2(50.0, 80.0),
+        ));
+        let original = canvas.elements.clone();
+        for horizontal in [true, false] {
+            canvas.align_selected_endpoints(horizontal);
+            assert_eq!(canvas.elements, original);
+        }
+        canvas.selected_endpoints.push(DraggedEndpoint {
+            element_index: 0,
+            is_start: true,
+        });
+        for horizontal in [true, false] {
+            canvas.align_selected_endpoints(horizontal);
+            assert_eq!(canvas.elements, original);
+        }
+    }
 }
