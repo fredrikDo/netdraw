@@ -79,6 +79,7 @@ enum SavedFont {
     Comfortaa,
     DejaVuSansCondensed,
     FiraMono,
+    LatinModern,
 }
 
 impl From<&Drawing> for SavedDrawing {
@@ -225,6 +226,7 @@ impl From<LabelFont> for SavedFont {
             LabelFont::Comfortaa => Self::Comfortaa,
             LabelFont::DejaVuSansCondensed => Self::DejaVuSansCondensed,
             LabelFont::FiraMono => Self::FiraMono,
+            LabelFont::LatinModern => Self::LatinModern,
         }
     }
 }
@@ -238,6 +240,7 @@ impl From<SavedFont> for LabelFont {
             SavedFont::Comfortaa => Self::Comfortaa,
             SavedFont::DejaVuSansCondensed => Self::DejaVuSansCondensed,
             SavedFont::FiraMono => Self::FiraMono,
+            SavedFont::LatinModern => Self::LatinModern,
         }
     }
 }

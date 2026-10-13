@@ -807,7 +807,7 @@ impl Canvas {
                 painter.line_segment([arrow_tip, arrow_tip + egui::vec2(-3.5, 3.0)], stroke);
             }
             ToolIcon::Select => {
-                let tip = rect.left_top() + egui::vec2(3.0, 2.0);
+                let tip = center + egui::vec2(-8.0, -9.0);
                 let points = [
                     tip,
                     tip + egui::vec2(4.0, 17.0),
@@ -817,11 +817,7 @@ impl Canvas {
                     tip + egui::vec2(10.0, 9.0),
                     tip + egui::vec2(17.0, 7.0),
                 ];
-                painter.add(egui::Shape::convex_polygon(
-                    points.to_vec(),
-                    color,
-                    egui::Stroke::new(1.0, egui::Color32::BLACK),
-                ));
+                painter.add(egui::Shape::closed_line(points.to_vec(), stroke));
             }
             ToolIcon::Label => {
                 painter.text(

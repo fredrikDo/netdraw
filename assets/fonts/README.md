@@ -11,4 +11,8 @@ NetDraw bundles these fonts so canvas labels and exported SVG files render consi
 | Cantarell | `Cantarell-Regular.otf` | SIL Open Font License 1.1 (`licenses/Cantarell-COPYING`) |
 | DejaVu Sans Condensed | `DejaVuSansCondensed.ttf` | DejaVu Fonts License (`licenses/DejaVu-LICENSE`) |
 
+| Latin Modern | `lmroman10-regular.otf` | GUST Font License (`licenses/GUST-FONT-LICENSE.TXT`) |
+
+Latin Modern Roman 10 Regular comes from the [official CTAN Latin Modern package](https://ctan.org/pkg/lm). Its accompanying documentation and copyright notices are in `licenses/README-Latin-Modern.TXT`.
+
 The font files are redistributed under their respective license terms above.

@@ -13,6 +13,7 @@ pub enum LabelFont {
     Comfortaa,
     DejaVuSansCondensed,
     FiraMono,
+    LatinModern,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,13 +149,14 @@ pub fn parse_label(input: &str) -> Vec<LabelSpan> {
 }
 
 impl LabelFont {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Inter,
         Self::NotoSans,
         Self::Cantarell,
         Self::Comfortaa,
         Self::DejaVuSansCondensed,
         Self::FiraMono,
+        Self::LatinModern,
     ];
 
     pub fn display_name(self) -> &'static str {
@@ -165,6 +167,7 @@ impl LabelFont {
             Self::Comfortaa => "Comfortaa",
             Self::DejaVuSansCondensed => "DejaVu Sans Condensed",
             Self::FiraMono => "Fira Mono",
+            Self::LatinModern => "Latin Modern",
         }
     }
 
@@ -176,6 +179,7 @@ impl LabelFont {
             Self::Comfortaa => "netdraw_comfortaa",
             Self::DejaVuSansCondensed => "netdraw_dejavu_sans_condensed",
             Self::FiraMono => "netdraw_fira_mono",
+            Self::LatinModern => "netdraw_latin_modern",
         }
     }
 
@@ -187,6 +191,7 @@ impl LabelFont {
             Self::Comfortaa => "NetDraw Comfortaa",
             Self::DejaVuSansCondensed => "NetDraw DejaVu Sans Condensed",
             Self::FiraMono => "NetDraw Fira Mono",
+            Self::LatinModern => "NetDraw Latin Modern",
         }
     }
 
@@ -200,12 +205,13 @@ impl LabelFont {
                 include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf")
             }
             Self::FiraMono => include_bytes!("../assets/fonts/FiraMono-Medium.ttf"),
+            Self::LatinModern => include_bytes!("../assets/fonts/lmroman10-regular.otf"),
         }
     }
 
     pub fn svg_format(self) -> (&'static str, &'static str) {
         match self {
-            Self::Cantarell | Self::Comfortaa => ("font/otf", "opentype"),
+            Self::Cantarell | Self::Comfortaa | Self::LatinModern => ("font/otf", "opentype"),
             _ => ("font/ttf", "truetype"),
         }
     }
