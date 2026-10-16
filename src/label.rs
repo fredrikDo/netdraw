@@ -8,12 +8,9 @@ const ELEMENT_CLEARANCE: f32 = 8.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelFont {
     Inter,
-    NotoSans,
-    Cantarell,
-    Comfortaa,
-    DejaVuSansCondensed,
-    FiraMono,
-    LatinModern,
+    SourceSerif4,
+    IbmPlexMono,
+    AtkinsonHyperlegible,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -149,69 +146,54 @@ pub fn parse_label(input: &str) -> Vec<LabelSpan> {
 }
 
 impl LabelFont {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 4] = [
         Self::Inter,
-        Self::NotoSans,
-        Self::Cantarell,
-        Self::Comfortaa,
-        Self::DejaVuSansCondensed,
-        Self::FiraMono,
-        Self::LatinModern,
+        Self::SourceSerif4,
+        Self::IbmPlexMono,
+        Self::AtkinsonHyperlegible,
     ];
 
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Inter => "Inter",
-            Self::NotoSans => "Noto Sans",
-            Self::Cantarell => "Cantarell",
-            Self::Comfortaa => "Comfortaa",
-            Self::DejaVuSansCondensed => "DejaVu Sans Condensed",
-            Self::FiraMono => "Fira Mono",
-            Self::LatinModern => "Latin Modern",
+            Self::SourceSerif4 => "Source Serif 4",
+            Self::IbmPlexMono => "IBM Plex Mono",
+            Self::AtkinsonHyperlegible => "Atkinson Hyperlegible",
         }
     }
 
     fn key(self) -> &'static str {
         match self {
             Self::Inter => "netdraw_inter",
-            Self::NotoSans => "netdraw_noto_sans",
-            Self::Cantarell => "netdraw_cantarell",
-            Self::Comfortaa => "netdraw_comfortaa",
-            Self::DejaVuSansCondensed => "netdraw_dejavu_sans_condensed",
-            Self::FiraMono => "netdraw_fira_mono",
-            Self::LatinModern => "netdraw_latin_modern",
+            Self::SourceSerif4 => "netdraw_source_serif4",
+            Self::IbmPlexMono => "netdraw_ibm_plex_mono",
+            Self::AtkinsonHyperlegible => "netdraw_atkinson_hyperlegible",
         }
     }
 
     fn svg_family(self) -> &'static str {
         match self {
             Self::Inter => "NetDraw Inter",
-            Self::NotoSans => "NetDraw Noto Sans",
-            Self::Cantarell => "NetDraw Cantarell",
-            Self::Comfortaa => "NetDraw Comfortaa",
-            Self::DejaVuSansCondensed => "NetDraw DejaVu Sans Condensed",
-            Self::FiraMono => "NetDraw Fira Mono",
-            Self::LatinModern => "NetDraw Latin Modern",
+            Self::SourceSerif4 => "NetDraw Source Serif 4",
+            Self::IbmPlexMono => "NetDraw IBM Plex Mono",
+            Self::AtkinsonHyperlegible => "NetDraw Atkinson Hyperlegible",
         }
     }
 
     pub fn bytes(self) -> &'static [u8] {
         match self {
             Self::Inter => include_bytes!("../assets/fonts/Inter-Regular.ttf"),
-            Self::NotoSans => include_bytes!("../assets/fonts/NotoSans-Regular.ttf"),
-            Self::Cantarell => include_bytes!("../assets/fonts/Cantarell-Regular.otf"),
-            Self::Comfortaa => include_bytes!("../assets/fonts/Comfortaa-Regular.otf"),
-            Self::DejaVuSansCondensed => {
-                include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf")
+            Self::SourceSerif4 => include_bytes!("../assets/fonts/SourceSerif4-Regular.otf"),
+            Self::IbmPlexMono => include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+            Self::AtkinsonHyperlegible => {
+                include_bytes!("../assets/fonts/AtkinsonHyperlegible-Regular.ttf")
             }
-            Self::FiraMono => include_bytes!("../assets/fonts/FiraMono-Medium.ttf"),
-            Self::LatinModern => include_bytes!("../assets/fonts/lmroman10-regular.otf"),
         }
     }
 
     pub fn svg_format(self) -> (&'static str, &'static str) {
         match self {
-            Self::Cantarell | Self::Comfortaa | Self::LatinModern => ("font/otf", "opentype"),
+            Self::SourceSerif4 => ("font/otf", "opentype"),
             _ => ("font/ttf", "truetype"),
         }
     }

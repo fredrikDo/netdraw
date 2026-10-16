@@ -1649,7 +1649,7 @@ mod tests {
             .elements
             .push(Element::Line(egui::pos2(0.0, 0.0), egui::pos2(50.0, 0.0)));
         canvas.labels.push("R_1".into());
-        canvas.label_style.font = crate::label::LabelFont::LatinModern;
+        canvas.label_style.font = crate::label::LabelFont::SourceSerif4;
         let edited = canvas.drawing();
         canvas.clean_drawing = edited.clone();
         canvas.undo(); // Includes changes that have not yet been committed at frame end.

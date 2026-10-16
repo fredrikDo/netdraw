@@ -1,18 +1,24 @@
 # Bundled fonts
 
-NetDraw bundles these fonts so canvas labels and exported SVG files render consistently:
+NetDraw bundles regular upright fonts for canvas labels and embeds the selected font in exported SVG files. Inter is the default.
 
-| Font | File | License |
-| --- | --- | --- |
-| Inter | `Inter-Regular.ttf` | SIL Open Font License 1.1 (`licenses/Inter-LICENSE`) |
-| Noto Sans | `NotoSans-Regular.ttf` | SIL Open Font License 1.1 (`licenses/NotoSans-LICENSE`) |
-| Fira Mono | `FiraMono-Medium.ttf` | SIL Open Font License 1.1 (`licenses/FiraMono-LICENSE`) |
-| Comfortaa | `Comfortaa-Regular.otf` | SIL Open Font License 1.1 (`licenses/Comfortaa-OFL.txt`) |
-| Cantarell | `Cantarell-Regular.otf` | SIL Open Font License 1.1 (`licenses/Cantarell-COPYING`) |
-| DejaVu Sans Condensed | `DejaVuSansCondensed.ttf` | DejaVu Fonts License (`licenses/DejaVu-LICENSE`) |
+| Font | File | License | Source |
+| --- | --- | --- | --- |
+| Inter | `Inter-Regular.ttf` | SIL Open Font License 1.1 (`licenses/Inter-LICENSE`) | [Inter](https://github.com/rsms/inter) |
+| Source Serif 4 | `SourceSerif4-Regular.otf` | SIL Open Font License 1.1 (`licenses/SourceSerif4-OFL.txt`) | [Adobe Source Serif](https://github.com/adobe-fonts/source-serif/tree/release) |
+| IBM Plex Mono | `IBMPlexMono-Regular.ttf` | SIL Open Font License 1.1 (`licenses/IBMPlexMono-OFL.txt`) | [Google Fonts](https://github.com/google/fonts/tree/main/ofl/ibmplexmono) |
+| Atkinson Hyperlegible | `AtkinsonHyperlegible-Regular.ttf` | SIL Open Font License 1.1 (`licenses/AtkinsonHyperlegible-OFL.txt`) | [Google Fonts](https://github.com/google/fonts/tree/main/ofl/atkinsonhyperlegible) |
 
-| Latin Modern | `lmroman10-regular.otf` | GUST Font License (`licenses/GUST-FONT-LICENSE.TXT`) |
+The font files are redistributed unchanged under their accompanying licenses, which include copyright notices.
 
-Latin Modern Roman 10 Regular comes from the [official CTAN Latin Modern package](https://ctan.org/pkg/lm). Its accompanying documentation and copyright notices are in `licenses/README-Latin-Modern.TXT`.
+## Older drawings
 
-The font files are redistributed under their respective license terms above.
+Removed fonts are no longer bundled or offered in the picker. When opening an older `.netdraw` drawing, NetDraw substitutes fonts as follows:
+
+| Previous font | Replacement |
+| --- | --- |
+| Noto Sans, Cantarell, Comfortaa, DejaVu Sans Condensed | Inter |
+| Fira Mono | IBM Plex Mono |
+| Latin Modern | Source Serif 4 |
+
+Saving the drawing records the replacement font. Label size is preserved; text metrics and appearance may change.

@@ -54,7 +54,9 @@ Labels support simple subscript and superscript notation:
 - `R_(total)` groups multiple subscript characters.
 - A backslash escapes a marker when a literal `_` or `^` is needed.
 
-The label typography dialog lets you select a bundled font and adjust its size. Selected fonts are embedded in exported SVG files for consistent rendering.
+The label typography dialog lets you choose **Inter** (the default), **Source Serif 4**, **IBM Plex Mono**, or **Atkinson Hyperlegible**, and adjust the label size. These regular upright fonts are bundled with the app and embedded in exported SVG files for consistent rendering.
+
+Drawings using removed fonts open with a replacement from the new selection. See [bundled fonts](assets/fonts/README.md) for sources, licenses, and the replacement mapping.
 
 ## Project status
 
@@ -72,4 +74,4 @@ The application is built with [egui/eframe](https://github.com/emilk/egui) and u
 
 ## License
 
-NetDraw is free and open-source software released under the [MIT License](LICENSE).
+NetDraw is free and open-source software released under the [MIT License](LICENSE). Bundled fonts use the SIL Open Font License 1.1; see [font licenses and sources](assets/fonts/README.md).

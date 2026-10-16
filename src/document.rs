@@ -73,13 +73,18 @@ struct SavedLabelStyle {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SavedFont {
+    #[serde(
+        alias = "noto_sans",
+        alias = "cantarell",
+        alias = "comfortaa",
+        alias = "deja_vu_sans_condensed"
+    )]
     Inter,
-    NotoSans,
-    Cantarell,
-    Comfortaa,
-    DejaVuSansCondensed,
-    FiraMono,
-    LatinModern,
+    #[serde(rename = "source_serif_4", alias = "latin_modern")]
+    SourceSerif4,
+    #[serde(alias = "fira_mono")]
+    IbmPlexMono,
+    AtkinsonHyperlegible,
 }
 
 impl From<&Drawing> for SavedDrawing {
@@ -221,12 +226,9 @@ impl From<LabelFont> for SavedFont {
     fn from(font: LabelFont) -> Self {
         match font {
             LabelFont::Inter => Self::Inter,
-            LabelFont::NotoSans => Self::NotoSans,
-            LabelFont::Cantarell => Self::Cantarell,
-            LabelFont::Comfortaa => Self::Comfortaa,
-            LabelFont::DejaVuSansCondensed => Self::DejaVuSansCondensed,
-            LabelFont::FiraMono => Self::FiraMono,
-            LabelFont::LatinModern => Self::LatinModern,
+            LabelFont::SourceSerif4 => Self::SourceSerif4,
+            LabelFont::IbmPlexMono => Self::IbmPlexMono,
+            LabelFont::AtkinsonHyperlegible => Self::AtkinsonHyperlegible,
         }
     }
 }
@@ -235,12 +237,9 @@ impl From<SavedFont> for LabelFont {
     fn from(font: SavedFont) -> Self {
         match font {
             SavedFont::Inter => Self::Inter,
-            SavedFont::NotoSans => Self::NotoSans,
-            SavedFont::Cantarell => Self::Cantarell,
-            SavedFont::Comfortaa => Self::Comfortaa,
-            SavedFont::DejaVuSansCondensed => Self::DejaVuSansCondensed,
-            SavedFont::FiraMono => Self::FiraMono,
-            SavedFont::LatinModern => Self::LatinModern,
+            SavedFont::SourceSerif4 => Self::SourceSerif4,
+            SavedFont::IbmPlexMono => Self::IbmPlexMono,
+            SavedFont::AtkinsonHyperlegible => Self::AtkinsonHyperlegible,
         }
     }
 }
@@ -267,13 +266,40 @@ mod tests {
                 text: "B".into(),
             }],
             label_style: LabelStyle {
-                font: LabelFont::FiraMono,
+                font: LabelFont::IbmPlexMono,
                 size: 21.0,
             },
         };
 
         let json = drawing.to_json().unwrap();
         assert_eq!(Drawing::from_json(&json).unwrap(), drawing);
+    }
+
+    #[test]
+    fn all_current_fonts_round_trip_and_legacy_fonts_migrate() {
+        for font in LabelFont::ALL {
+            let mut drawing = Drawing::empty();
+            drawing.label_style.font = font;
+            assert_eq!(
+                Drawing::from_json(&drawing.to_json().unwrap()).unwrap(),
+                drawing
+            );
+        }
+        let json = Drawing::empty().to_json().unwrap();
+        for (old, expected) in [
+            ("noto_sans", LabelFont::Inter),
+            ("cantarell", LabelFont::Inter),
+            ("comfortaa", LabelFont::Inter),
+            ("deja_vu_sans_condensed", LabelFont::Inter),
+            ("fira_mono", LabelFont::IbmPlexMono),
+            ("latin_modern", LabelFont::SourceSerif4),
+        ] {
+            let old_json = json.replace("\"inter\"", &format!("\"{old}\""));
+            let drawing = Drawing::from_json(&old_json).unwrap();
+            assert_eq!(drawing.label_style.font, expected);
+            assert_eq!(drawing.label_style.size, 18.0);
+            assert!(!drawing.to_json().unwrap().contains(old));
+        }
     }
 
     #[test]

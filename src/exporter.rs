@@ -556,21 +556,21 @@ mod tests {
     fn exports_selected_label_typography() {
         let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
         let ctx = test_context();
-        let document = svg(
-            &ctx,
-            &elements,
-            &[String::from("R1")],
-            &[],
-            &[],
-            label::LabelStyle {
-                font: label::LabelFont::FiraMono,
-                size: 22.0,
-            },
-        );
-
-        assert!(document.contains(r#"font-family="NetDraw Fira Mono""#));
-        assert!(document.contains(r#"font-size="22""#));
-        assert!(document.contains("data:font/ttf;base64,"));
+        for font in label::LabelFont::ALL {
+            let document = svg(
+                &ctx,
+                &elements,
+                &[String::from("R1")],
+                &[],
+                &[],
+                label::LabelStyle { font, size: 22.0 },
+            );
+            assert!(document.contains(&format!("font-family=\"NetDraw {}\"", font.display_name())));
+            assert!(document.contains(r#"font-size="22""#));
+            let (mime, format) = font.svg_format();
+            assert!(document.contains(&format!("data:{mime};base64,")));
+            assert!(document.contains(&format!("format('{format}')")));
+        }
     }
 
     #[test]
