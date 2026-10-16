@@ -35,6 +35,7 @@ enum ToolIcon {
     CleanAll,
     AlignHorizontal,
     AlignVertical,
+    EqualLengths,
 }
 
 pub fn run() -> eframe::Result<()> {
@@ -71,6 +72,9 @@ struct Canvas {
     editing_label: Option<EditingLabel>,
     current_path: Option<PathBuf>,
     clean_drawing: Drawing,
+    history_drawing: Drawing,
+    undo_stack: Vec<Drawing>,
+    redo_stack: Vec<Drawing>,
     file_status: Option<String>,
     pending_file_action: Option<FileAction>,
     allow_close: bool,
@@ -115,6 +119,9 @@ impl Default for Canvas {
             editing_label: None,
             current_path: None,
             clean_drawing: Drawing::empty(),
+            history_drawing: Drawing::empty(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             file_status: None,
             pending_file_action: None,
             allow_close: false,
@@ -129,6 +136,7 @@ impl Canvas {
             crate::label::install_fonts(ui.ctx());
             self.fonts_installed = true;
         }
+        self.handle_edit_shortcuts(ui.ctx());
         self.handle_window_close(ui.ctx());
         self.show_menu_bar(ui);
         self.show_toolbar(ui);
@@ -139,6 +147,11 @@ impl Canvas {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| self.show_canvas(ui));
+
+        // Group a drag, erase stroke, or label editing session into one action.
+        if !ui.input(|input| input.pointer.any_down()) && self.editing_label.is_none() {
+            self.record_edit();
+        }
     }
 
     fn apply_button_colors(ui: &mut egui::Ui) {
@@ -329,7 +342,25 @@ impl Canvas {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                ui.label("Edit actions will appear here.");
+                let can_undo =
+                    !self.undo_stack.is_empty() || self.drawing() != self.history_drawing;
+                if ui
+                    .add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z"))
+                    .clicked()
+                {
+                    self.undo();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !self.redo_stack.is_empty() && self.drawing() == self.history_drawing,
+                        egui::Button::new("Redo").shortcut_text("Ctrl+Y"),
+                    )
+                    .clicked()
+                {
+                    self.redo();
+                    ui.close();
+                }
             });
             ui.menu_button("Help", |ui| {
                 ui.label("Help information will appear here.");
@@ -356,6 +387,54 @@ impl Canvas {
             node_labels: self.node_labels.clone(),
             terminal_labels: self.terminal_labels.clone(),
             label_style: self.label_style,
+        }
+    }
+
+    fn record_edit(&mut self) {
+        let drawing = self.drawing();
+        if drawing != self.history_drawing {
+            self.undo_stack
+                .push(std::mem::replace(&mut self.history_drawing, drawing));
+            if self.undo_stack.len() > 100 {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
+    }
+
+    fn reset_history(&mut self) {
+        self.history_drawing = self.drawing();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        self.record_edit();
+        if let Some(drawing) = self.undo_stack.pop() {
+            self.redo_stack.push(self.drawing());
+            self.history_drawing = drawing.clone();
+            self.apply_drawing(drawing);
+        }
+    }
+
+    fn redo(&mut self) {
+        self.record_edit();
+        if let Some(drawing) = self.redo_stack.pop() {
+            self.undo_stack.push(self.drawing());
+            self.history_drawing = drawing.clone();
+            self.apply_drawing(drawing);
+        }
+    }
+
+    fn handle_edit_shortcuts(&mut self, ctx: &egui::Context) {
+        // Let text fields handle their own undo while they have keyboard focus.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
+            self.undo();
+        } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) {
+            self.redo();
         }
     }
 
@@ -486,6 +565,7 @@ impl Canvas {
         match result {
             Ok(drawing) => {
                 self.apply_drawing(drawing.clone());
+                self.reset_history();
                 self.clean_drawing = drawing;
                 self.current_path = Some(path.clone());
                 self.file_status = Some(format!("Opened {}", path.display()));
@@ -497,6 +577,7 @@ impl Canvas {
     fn new_drawing(&mut self) {
         let drawing = Drawing::empty();
         self.apply_drawing(drawing.clone());
+        self.reset_history();
         self.clean_drawing = drawing;
         self.current_path = None;
         self.file_status = Some(String::from("New drawing"));
@@ -679,6 +760,16 @@ impl Canvas {
                 {
                     self.align_selected_endpoints(false);
                 }
+                if Self::tool_button(
+                    ui,
+                    false,
+                    ToolIcon::EqualLengths,
+                    "Equalize connected lengths",
+                )
+                .clicked()
+                {
+                    self.equalize_selected_lengths();
+                }
             });
             self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
             ui.separator();
@@ -739,8 +830,15 @@ impl Canvas {
             egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
         });
 
-        let color = egui::Color32::WHITE;
-        Self::paint_tool_icon(ui.painter(), response.rect.shrink(7.0), icon, color);
+        let mut painter = ui.painter().clone();
+        let color = if ui.is_enabled() {
+            egui::Color32::WHITE
+        } else {
+            // Use solid gray rather than the disabled UI's alpha multiplier.
+            painter.set_opacity(1.0);
+            egui::Color32::from_gray(128)
+        };
+        Self::paint_tool_icon(&painter, response.rect.shrink(7.0), icon, color);
         response.on_hover_text(label)
     }
 
@@ -767,6 +865,28 @@ impl Canvas {
                 for position in [center - offset, center, center + offset] {
                     painter.circle_filled(position, 2.8, color);
                 }
+            }
+            ToolIcon::EqualLengths => {
+                for side in [-1.0, 1.0] {
+                    let bar = center + egui::vec2(side * 10.0, 0.0);
+                    painter.line_segment(
+                        [bar - egui::vec2(0.0, 7.0), bar + egui::vec2(0.0, 7.0)],
+                        stroke,
+                    );
+                    let tip = center + egui::vec2(side * 6.0, 0.0);
+                    painter.add(egui::Shape::line(
+                        vec![
+                            tip + egui::vec2(-side * 3.0, -3.0),
+                            tip,
+                            tip + egui::vec2(-side * 3.0, 3.0),
+                        ],
+                        stroke,
+                    ));
+                }
+                painter.line_segment(
+                    [center - egui::vec2(6.0, 0.0), center + egui::vec2(6.0, 0.0)],
+                    stroke,
+                );
             }
             ToolIcon::Line => {
                 painter.line_segment([left, right], stroke);
@@ -887,6 +1007,47 @@ impl Canvas {
                 );
             }
         }
+    }
+
+    fn equalize_selected_lengths(&mut self) {
+        if self.selected_endpoints.len() < 2 {
+            return;
+        }
+        // Treat coincident handles as one junction, including attached unselected handles.
+        let mut positions = Vec::new();
+        for endpoint in &self.selected_endpoints {
+            let (start, end) = self.elements[endpoint.element_index].endpoints();
+            let position = if endpoint.is_start { start } else { end };
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+        }
+        let mut edges = Vec::new();
+        for element in &self.elements {
+            let (start, end) = element.endpoints();
+            if let (Some(a), Some(b)) = (
+                positions.iter().position(|p| *p == start),
+                positions.iter().position(|p| *p == end),
+            ) {
+                let edge = (a.min(b), a.max(b));
+                if a != b && !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+        if edges.len() < 2 {
+            return;
+        }
+        let new_positions = equal_length_positions(&positions, &edges);
+        for element in &mut self.elements {
+            let (start, end) = element.endpoints();
+            for (is_start, position) in [(true, start), (false, end)] {
+                if let Some(index) = positions.iter().position(|p| *p == position) {
+                    element.move_endpoint(is_start, new_positions[index]);
+                }
+            }
+        }
+        self.update_endpoint_labels(&positions, &new_positions);
     }
 
     fn align_selected_endpoints(&mut self, horizontal: bool) {
@@ -1362,6 +1523,69 @@ impl Canvas {
     }
 }
 
+// Fit equal-length vectors in the original directions first, then relax the length
+// constraints. Trees can retain their angles exactly; loops may need to change them.
+fn equal_length_positions(positions: &[egui::Pos2], edges: &[(usize, usize)]) -> Vec<egui::Pos2> {
+    let mut result = positions.to_vec();
+    if edges.is_empty() {
+        return result;
+    }
+    let target = edges
+        .iter()
+        .map(|&(a, b)| positions[a].distance(positions[b]))
+        .sum::<f32>()
+        / edges.len() as f32;
+    let directions: Vec<_> = edges
+        .iter()
+        .map(|&(a, b)| (positions[b] - positions[a]).normalized())
+        .collect();
+    let mut degrees = vec![0.0_f32; positions.len()];
+    for &(a, b) in edges {
+        degrees[a] += 1.0;
+        degrees[b] += 1.0;
+    }
+    let step = 0.45 / degrees.into_iter().fold(1.0_f32, f32::max);
+    for _ in 0..1000 {
+        let mut corrections = vec![egui::Vec2::ZERO; positions.len()];
+        let mut largest = 0.0_f32;
+        for (&(a, b), direction) in edges.iter().zip(&directions) {
+            let error = (result[b] - result[a]) - *direction * target;
+            corrections[a] += error;
+            corrections[b] -= error;
+        }
+        for (position, correction) in result.iter_mut().zip(corrections) {
+            *position += correction * step;
+            largest = largest.max(correction.length() * step);
+        }
+        if largest < 0.0001 {
+            break;
+        }
+    }
+    // Pairwise corrections preserve the centroid of each connected component.
+    // Bound the work for overconstrained graphs where exact equality is impossible.
+    for _ in 0..1000 {
+        let mut largest = 0.0_f32;
+        for (&(a, b), original_direction) in edges.iter().zip(&directions) {
+            let delta = result[b] - result[a];
+            let length = delta.length();
+            let direction = if length > 0.0001 {
+                delta / length
+            } else {
+                *original_direction
+            };
+            let error = length - target;
+            let correction = direction * (error * 0.5);
+            result[a] += correction;
+            result[b] -= correction;
+            largest = largest.max(error.abs());
+        }
+        if largest < 0.001 {
+            break;
+        }
+    }
+    result
+}
+
 fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
     for (start, end) in [
         (rect.left_top(), rect.right_top()),
@@ -1416,6 +1640,157 @@ fn byte_index_at_char(text: &str, char_index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undo_redo_restores_drawing_and_saved_state() {
+        let mut canvas = Canvas::default();
+        let empty = canvas.drawing();
+        canvas
+            .elements
+            .push(Element::Line(egui::pos2(0.0, 0.0), egui::pos2(50.0, 0.0)));
+        canvas.labels.push("R_1".into());
+        canvas.label_style.font = crate::label::LabelFont::LatinModern;
+        let edited = canvas.drawing();
+        canvas.clean_drawing = edited.clone();
+        canvas.undo(); // Includes changes that have not yet been committed at frame end.
+        assert_eq!(canvas.drawing(), empty);
+        assert!(canvas.is_dirty());
+        canvas.redo();
+        assert_eq!(canvas.drawing(), edited);
+        assert!(!canvas.is_dirty());
+        canvas.undo();
+        canvas.label_style.size = 30.0;
+        canvas.record_edit();
+        assert!(canvas.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn new_drawing_resets_history() {
+        let mut canvas = Canvas::default();
+        canvas.label_style.size = 30.0;
+        canvas.record_edit();
+        canvas.undo();
+        canvas.new_drawing();
+        canvas.redo();
+        assert_eq!(canvas.drawing(), Drawing::empty());
+        assert!(canvas.undo_stack.is_empty());
+        assert!(canvas.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn control_z_and_y_restore_drawing() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::default();
+        canvas.label_style.size = 30.0;
+        canvas.record_edit();
+        for (key, expected_size) in [(egui::Key::Z, 18.0), (egui::Key::Y, 30.0)] {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            });
+            let mut output = ctx.run_ui(input, |ui| canvas.handle_edit_shortcuts(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(canvas.label_style.size, expected_size);
+        }
+    }
+
+    #[test]
+    fn equal_lengths_preserves_chain_angles_and_center() {
+        let points = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(100.0, 200.0),
+        ];
+        let result = equal_length_positions(&points, &[(0, 1), (1, 2)]);
+        assert!((result[0].distance(result[1]) - 150.0).abs() < 0.01);
+        assert!((result[1].distance(result[2]) - 150.0).abs() < 0.01);
+        assert!((result[0].y - result[1].y).abs() < 0.01);
+        assert!((result[1].x - result[2].x).abs() < 0.01);
+        let before = points
+            .iter()
+            .map(|p| p.to_vec2())
+            .fold(egui::Vec2::ZERO, |sum, p| sum + p);
+        let after = result
+            .iter()
+            .map(|p| p.to_vec2())
+            .fold(egui::Vec2::ZERO, |sum, p| sum + p);
+        assert!((before - after).length() < 0.01);
+    }
+
+    #[test]
+    fn equal_lengths_handles_closed_loops_and_degenerate_selections() {
+        let points = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(100.0, 200.0),
+            egui::pos2(0.0, 200.0),
+        ];
+        let edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
+        let result = equal_length_positions(&points, &edges);
+        for (a, b) in edges {
+            assert!((result[a].distance(result[b]) - 150.0).abs() < 0.01);
+        }
+        assert_eq!(equal_length_positions(&points, &[]), points);
+        let coincident = vec![egui::Pos2::ZERO; 3];
+        assert_eq!(
+            equal_length_positions(&coincident, &[(0, 1), (1, 2)]),
+            coincident
+        );
+    }
+
+    #[test]
+    fn equal_lengths_keeps_junctions_labels_and_undo() {
+        let mut canvas = Canvas::default();
+        canvas.elements = vec![
+            Element::Resistor(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0)),
+            Element::Resistor(egui::pos2(100.0, 0.0), egui::pos2(100.0, 200.0)),
+            Element::Line(egui::pos2(100.0, 0.0), egui::pos2(300.0, 300.0)),
+        ];
+        canvas.labels = vec![String::new(); 3];
+        canvas.selected_endpoints = vec![
+            DraggedEndpoint {
+                element_index: 0,
+                is_start: true,
+            },
+            DraggedEndpoint {
+                element_index: 0,
+                is_start: false,
+            },
+            DraggedEndpoint {
+                element_index: 1,
+                is_start: false,
+            },
+        ];
+        canvas.node_labels.push(crate::label::NodeLabel {
+            position: egui::pos2(100.0, 0.0),
+            text: "A".into(),
+        });
+        canvas.reset_history();
+        let before = canvas.drawing();
+        canvas.equalize_selected_lengths();
+        let after = canvas.drawing();
+        assert_eq!(
+            canvas.elements[0].endpoints().1,
+            canvas.elements[1].endpoints().0
+        );
+        assert_eq!(
+            canvas.elements[0].endpoints().1,
+            canvas.elements[2].endpoints().0
+        );
+        assert_eq!(
+            canvas.node_labels[0].position,
+            canvas.elements[0].endpoints().1
+        );
+        assert_eq!(canvas.elements[2].endpoints().1, egui::pos2(300.0, 300.0));
+        canvas.undo();
+        assert_eq!(canvas.drawing(), before);
+        canvas.redo();
+        assert_eq!(canvas.drawing(), after);
+    }
 
     #[test]
     fn alignment_moves_only_selected_coordinates_and_attached_labels() {
