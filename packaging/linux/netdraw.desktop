@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NetDraw
+Comment=Create and edit network diagrams
+Exec=Netdraw
+Icon=netdraw
+Terminal=false
+Categories=Graphics;Engineering;
+StartupWMClass=netdraw

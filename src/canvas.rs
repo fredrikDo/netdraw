@@ -27,6 +27,7 @@ const SELECTED_TOOL_BORDER: egui::Color32 = egui::Color32::from_rgb(125, 195, 25
 
 #[derive(Clone, Copy)]
 enum ToolIcon {
+    Camera,
     Grid,
     SnapToGrid,
     Line,
@@ -43,7 +44,12 @@ enum ToolIcon {
 }
 
 pub fn run() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(crate::icon::app_icon())
+            .with_app_id("netdraw"),
+        ..Default::default()
+    };
     let mut canvas = Canvas::default();
 
     eframe::run_ui_native("NetDraw", options, move |ui, _frame| {
@@ -71,6 +77,8 @@ struct Canvas {
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
+    clipboard: Option<arboard::Clipboard>,
+    clipboard_status: Option<String>,
     label_style_dialog_open: bool,
     label_style: crate::label::LabelStyle,
     fonts_installed: bool,
@@ -119,6 +127,8 @@ impl Default for Canvas {
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
             export_status: None,
+            clipboard: None,
+            clipboard_status: None,
             label_style_dialog_open: false,
             label_style: crate::label::LabelStyle::default(),
             fonts_installed: false,
@@ -798,6 +808,39 @@ impl Canvas {
         self.label_style_dialog_open = open;
     }
 
+    fn copy_image(&mut self, ctx: &egui::Context) {
+        let result = (|| -> Result<(), String> {
+            let image = exporter::image(
+                ctx,
+                &self.elements,
+                &self.labels,
+                &self.node_labels,
+                &self.terminal_labels,
+                self.label_style,
+            )?;
+            // Keep the clipboard owner alive so Linux applications can request the image.
+            if self.clipboard.is_none() {
+                self.clipboard = Some(
+                    arboard::Clipboard::new()
+                        .map_err(|error| format!("Could not open clipboard: {error}"))?,
+                );
+            }
+            self.clipboard
+                .as_mut()
+                .unwrap()
+                .set_image(arboard::ImageData {
+                    width: image.width() as usize,
+                    height: image.height() as usize,
+                    bytes: std::borrow::Cow::Borrowed(image.data()),
+                })
+                .map_err(|error| format!("Could not copy image: {error}"))
+        })();
+        self.clipboard_status = Some(match result {
+            Ok(()) => "Image copied".into(),
+            Err(error) => error,
+        });
+    }
+
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if Self::tool_button(ui, self.grid_enabled, ToolIcon::Grid, "Grid: show and snap")
@@ -873,7 +916,21 @@ impl Canvas {
             if Self::tool_button(ui, false, ToolIcon::Typography, "Label typography").clicked() {
                 self.label_style_dialog_open = true;
             }
+            ui.separator();
+            ui.add_enabled_ui(!self.elements.is_empty(), |ui| {
+                if Self::tool_button(ui, false, ToolIcon::Camera, "Copy image")
+                    .on_hover_text(
+                        "Copy a tightly cropped diagram without grid or selection handles",
+                    )
+                    .clicked()
+                {
+                    self.copy_image(ui.ctx());
+                }
+            });
         });
+        if let Some(status) = &self.clipboard_status {
+            ui.label(status);
+        }
     }
 
     fn select_mode(&mut self, ui: &mut egui::Ui, mode: DrawMode, icon: ToolIcon, label: &str) {
@@ -933,6 +990,23 @@ impl Canvas {
         let right = egui::pos2(rect.right(), center.y);
 
         match icon {
+            ToolIcon::Camera => {
+                let body = egui::Rect::from_min_max(
+                    center + egui::vec2(-10.0, -5.0),
+                    center + egui::vec2(10.0, 8.0),
+                );
+                painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+                painter.circle_stroke(center + egui::vec2(0.0, 1.5), 4.0, stroke);
+                painter.add(egui::Shape::line(
+                    vec![
+                        center + egui::vec2(-5.0, -5.0),
+                        center + egui::vec2(-3.0, -9.0),
+                        center + egui::vec2(3.0, -9.0),
+                        center + egui::vec2(5.0, -5.0),
+                    ],
+                    stroke,
+                ));
+            }
             ToolIcon::SnapToGrid => {
                 painter.line_segment(
                     [center - egui::vec2(8.0, 0.0), center + egui::vec2(8.0, 0.0)],

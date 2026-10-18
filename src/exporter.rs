@@ -104,6 +104,59 @@ pub fn svg(
     output
 }
 
+/// Rasterize the same tightly cropped, clean figure used by SVG export.
+pub fn image(
+    ctx: &egui::Context,
+    elements: &[Element],
+    labels: &[String],
+    node_labels: &[label::NodeLabel],
+    terminal_labels: &[label::NodeLabel],
+    label_style: label::LabelStyle,
+) -> Result<resvg::tiny_skia::Pixmap, String> {
+    let mut options = resvg::usvg::Options::default();
+    options
+        .fontdb_mut()
+        .load_font_data(label_style.font.bytes().to_vec());
+    // usvg resolves installed font families rather than SVG @font-face aliases.
+    let family = options
+        .fontdb
+        .faces()
+        .next()
+        .and_then(|face| face.families.first())
+        .map(|(name, _)| name.clone())
+        .ok_or("Could not load the drawing font.")?;
+    let document = svg(
+        ctx,
+        elements,
+        labels,
+        node_labels,
+        terminal_labels,
+        label_style,
+    )
+    .replace(
+        &format!("font-family=\"{}\"", label_style.svg_family()),
+        &format!("font-family=\"'{}'\"", escape_xml(&family)),
+    );
+    let tree = resvg::usvg::Tree::from_str(&document, &options)
+        .map_err(|error| format!("Could not render drawing: {error}"))?;
+    // Two pixels per canvas point keeps pasted labels sharp.
+    let width = (tree.size().width() * 2.0).ceil() as u32;
+    let height = (tree.size().height() * 2.0).ceil() as u32;
+    if u64::from(width) * u64::from(height) > 32_000_000 {
+        return Err("Drawing is too large to copy as an image.".into());
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or("Could not allocate the drawing image.")?;
+    // Cover fractional edge pixels with white as well.
+    pixmap.fill(resvg::tiny_skia::Color::WHITE);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(2.0, 2.0),
+        &mut pixmap.as_mut(),
+    );
+    Ok(pixmap)
+}
+
 struct Bounds {
     min: egui::Pos2,
     max: egui::Pos2,
@@ -571,6 +624,70 @@ mod tests {
             assert!(document.contains(&format!("data:{mime};base64,")));
             assert!(document.contains(&format!("format('{format}')")));
         }
+    }
+
+    #[test]
+    fn clipboard_image_is_cropped_and_opaque() {
+        let ctx = test_context();
+        let elements = [Element::Line(
+            egui::pos2(500.0, 600.0),
+            egui::pos2(600.0, 600.0),
+        )];
+        let image = image(&ctx, &elements, &[], &[], &[], label::LabelStyle::default()).unwrap();
+        assert_eq!((image.width(), image.height()), (204, 4));
+        assert!(image.data().chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(image.data().chunks_exact(4).any(|pixel| pixel[0] < 128));
+    }
+
+    #[test]
+    fn clipboard_image_renders_bundled_fonts_and_scripts() {
+        let ctx = test_context();
+        // A degenerate source has no symbol, so dark pixels must come from the label.
+        let elements = [Element::PrescribedFlow(
+            egui::pos2(100.0, 100.0),
+            egui::pos2(100.0, 100.0),
+        )];
+        for font in label::LabelFont::ALL {
+            let with_label = image(
+                &ctx,
+                &elements,
+                &["R_(load)^2".into()],
+                &[],
+                &[],
+                label::LabelStyle { font, size: 22.0 },
+            )
+            .unwrap();
+            let without_label = image(
+                &ctx,
+                &elements,
+                &[],
+                &[],
+                &[],
+                label::LabelStyle { font, size: 22.0 },
+            )
+            .unwrap();
+            let dark_pixels = |image: &resvg::tiny_skia::Pixmap| {
+                image
+                    .data()
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[0] < 128)
+                    .count()
+            };
+            assert!(
+                dark_pixels(&with_label) > dark_pixels(&without_label) + 50,
+                "label missing for {font:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_image_rejects_excessive_dimensions() {
+        let ctx = test_context();
+        let elements = [Element::Line(
+            egui::Pos2::ZERO,
+            egui::pos2(100_000.0, 100_000.0),
+        )];
+        assert!(image(&ctx, &elements, &[], &[], &[], label::LabelStyle::default()).is_err());
     }
 
     #[test]

@@ -13,6 +13,7 @@ NetDraw is a lightweight desktop application for creating and editing network di
 - Use configurable fonts, subscripts, and superscripts in labels
 - Save editable drawings as `.netdraw` project files
 - Open existing `.netdraw` drawings and continue editing
+- Copy tightly cropped diagram images to the clipboard on Linux and Windows
 - Export finished diagrams as SVG with embedded fonts
 - Protect unsaved work when opening, creating, or closing drawings
 
@@ -45,7 +46,24 @@ The **File** menu provides two separate workflows:
 - **Save** and **Open** use the editable `.netdraw` project format.
 - **Export** creates an SVG for use in other applications.
 
+Click **Copy image** to paste a tightly cropped image of the complete drawing, including labels, into a document. The image has a white background and excludes the grid, selection handles, and unused canvas. Keep NetDraw open until you paste on Linux; clipboard persistence after closing depends on your clipboard manager. Linux supports X11 and Wayland compositors with clipboard data-control support.
+
 Keep the `.netdraw` file if you expect to edit a diagram again; an exported SVG is intended as final output.
+
+## Application icon
+
+The application uses the blue resistor icon in `assets/icons/netdraw.svg`. The window icon is embedded on all platforms, and Windows builds also embed `assets/icons/netdraw.ico` into the executable (using the Windows SDK resource compiler or MinGW `windres`).
+
+Linux desktop launchers, including Wayland desktops, use the supplied desktop entry and installed icon. After `cargo build --release`, install them for your user with:
+
+```sh
+install -Dm755 target/release/Netdraw ~/.local/bin/Netdraw
+install -Dm644 assets/icons/netdraw.svg ~/.local/share/icons/hicolor/scalable/apps/netdraw.svg
+install -Dm644 assets/icons/netdraw.png ~/.local/share/icons/hicolor/256x256/apps/netdraw.png
+install -Dm644 packaging/linux/netdraw.desktop ~/.local/share/applications/netdraw.desktop
+```
+
+Ensure `~/.local/bin` is in your desktop session's `PATH`, then launch **NetDraw** from the application menu.
 
 ## Labels
 
