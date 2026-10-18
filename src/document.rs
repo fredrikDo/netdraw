@@ -297,7 +297,7 @@ mod tests {
             let old_json = json.replace("\"inter\"", &format!("\"{old}\""));
             let drawing = Drawing::from_json(&old_json).unwrap();
             assert_eq!(drawing.label_style.font, expected);
-            assert_eq!(drawing.label_style.size, 18.0);
+            assert_eq!(drawing.label_style.size, 22.0);
             assert!(!drawing.to_json().unwrap().contains(old));
         }
     }

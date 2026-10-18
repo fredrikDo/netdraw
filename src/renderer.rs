@@ -1,10 +1,11 @@
 use eframe::egui;
 
-use crate::element::{ENDPOINT_RADIUS, Element, RESISTOR_TERMINAL_LENGTH, RESISTOR_ZIG_SEGMENTS};
+use crate::element::{
+    ENDPOINT_INTERACTION_DISTANCE, ENDPOINT_RADIUS, Element, RESISTOR_TERMINAL_LENGTH,
+    RESISTOR_ZIG_SEGMENTS,
+};
 use crate::label::{LabelStyle, Placement};
 
-// Endpoint handles appear only when the pointer is close enough to interact with them.
-const HANDLE_HOVER_DISTANCE: f32 = 24.0;
 const JUNCTION_NODE_RADIUS: f32 = 3.0;
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 
@@ -56,7 +57,7 @@ pub fn draw_endpoint_handles(
 
         for point in [start, end] {
             if !pointer_position
-                .is_some_and(|pointer| pointer.distance(point) <= HANDLE_HOVER_DISTANCE)
+                .is_some_and(|pointer| pointer.distance(point) <= ENDPOINT_INTERACTION_DISTANCE)
             {
                 continue;
             }

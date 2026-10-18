@@ -18,6 +18,8 @@ use crate::{
 
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
 const CANVAS_BACKGROUND: egui::Color32 = egui::Color32::WHITE;
+const GRID_SPACING: f32 = 20.0;
+const GRID_COLOR: egui::Color32 = egui::Color32::from_gray(215);
 const TOOL_BUTTON_SIZE: f32 = 36.0;
 const TOOL_BUTTON_BACKGROUND: egui::Color32 = egui::Color32::BLACK;
 const SELECTED_TOOL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(28, 100, 190);
@@ -25,6 +27,8 @@ const SELECTED_TOOL_BORDER: egui::Color32 = egui::Color32::from_rgb(125, 195, 25
 
 #[derive(Clone, Copy)]
 enum ToolIcon {
+    Grid,
+    SnapToGrid,
     Line,
     Resistor,
     PrescribedFlow,
@@ -63,6 +67,7 @@ struct Canvas {
     selection_pointer_down: bool,
     selection_drag_anchor: Option<DraggedEndpoint>,
     draw_mode: DrawMode,
+    grid_enabled: bool,
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
@@ -110,6 +115,7 @@ impl Default for Canvas {
             selection_pointer_down: false,
             selection_drag_anchor: None,
             draw_mode: DrawMode::Select,
+            grid_enabled: false,
             export_dialog_open: false,
             export_path: String::from("canvas.svg"),
             export_status: None,
@@ -170,6 +176,9 @@ impl Canvas {
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(CANVAS_SIZE, egui::Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, CANVAS_BACKGROUND);
+        if self.grid_enabled {
+            Self::draw_grid(&painter, response.rect);
+        }
         let origin = response.rect.min.to_vec2();
         let pointer_position = response
             .interact_pointer_pos()
@@ -308,6 +317,59 @@ impl Canvas {
             &screen_node_label_placements,
             &screen_terminal_label_placements,
         );
+    }
+
+    fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
+        let stroke = egui::Stroke::new(1.0, GRID_COLOR);
+        for column in 0..=(CANVAS_SIZE.x / GRID_SPACING) as usize {
+            let x = rect.left() + column as f32 * GRID_SPACING;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+        }
+        for row in 0..=(CANVAS_SIZE.y / GRID_SPACING) as usize {
+            let y = rect.top() + row as f32 * GRID_SPACING;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                stroke,
+            );
+        }
+    }
+
+    fn nearest_grid_intersection(position: egui::Pos2) -> egui::Pos2 {
+        egui::pos2(
+            (position.x / GRID_SPACING).round() * GRID_SPACING,
+            (position.y / GRID_SPACING).round() * GRID_SPACING,
+        )
+    }
+
+    fn snap_selected_to_grid(&mut self) {
+        let previous_positions: Vec<_> = self
+            .selected_endpoints
+            .iter()
+            .map(|endpoint| {
+                let (start, end) = self.elements[endpoint.element_index].endpoints();
+                if endpoint.is_start { start } else { end }
+            })
+            .collect();
+        let new_positions: Vec<_> = previous_positions
+            .iter()
+            .copied()
+            .map(Self::nearest_grid_intersection)
+            .collect();
+        for (endpoint, position) in self.selected_endpoints.iter().zip(&new_positions) {
+            self.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
+        }
+        self.update_endpoint_labels(&previous_positions, &new_positions);
+    }
+
+    fn snap_position(&self, position: egui::Pos2, ignored: &[DraggedEndpoint]) -> egui::Pos2 {
+        if self.grid_enabled {
+            Self::nearest_grid_intersection(position)
+        } else {
+            snap_to_endpoint(&self.elements, position, ignored)
+        }
     }
 
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -738,7 +800,24 @@ impl Canvas {
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            //ui.label("Draw:");
+            if Self::tool_button(ui, self.grid_enabled, ToolIcon::Grid, "Grid: show and snap")
+                .clicked()
+            {
+                self.grid_enabled = !self.grid_enabled;
+            }
+            ui.add_enabled_ui(!self.selected_endpoints.is_empty(), |ui| {
+                if Self::tool_button(
+                    ui,
+                    false,
+                    ToolIcon::SnapToGrid,
+                    "Snap selected endpoints to grid",
+                )
+                .clicked()
+                {
+                    self.snap_selected_to_grid();
+                }
+            });
+            ui.separator();
             self.select_mode(ui, DrawMode::Line, ToolIcon::Line, "Line");
             self.select_mode(ui, DrawMode::Resistor, ToolIcon::Resistor, "Resistance");
             self.select_mode(
@@ -854,6 +933,39 @@ impl Canvas {
         let right = egui::pos2(rect.right(), center.y);
 
         match icon {
+            ToolIcon::SnapToGrid => {
+                painter.line_segment(
+                    [center - egui::vec2(8.0, 0.0), center + egui::vec2(8.0, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [center - egui::vec2(0.0, 8.0), center + egui::vec2(0.0, 8.0)],
+                    stroke,
+                );
+                painter.circle_filled(center, 3.5, color);
+                painter.circle_stroke(rect.left_top(), 2.5, stroke);
+                painter.line_segment(
+                    [
+                        rect.left_top() + egui::vec2(3.0, 3.0),
+                        center - egui::vec2(3.0, 3.0),
+                    ],
+                    stroke,
+                );
+            }
+            ToolIcon::Grid => {
+                for fraction in [0.0, 0.5, 1.0] {
+                    let x = rect.left() + rect.width() * fraction;
+                    let y = rect.top() + rect.height() * fraction;
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        stroke,
+                    );
+                }
+            }
             ToolIcon::AlignHorizontal | ToolIcon::AlignVertical => {
                 let horizontal = matches!(icon, ToolIcon::AlignHorizontal);
                 let offset = if horizontal {
@@ -1038,7 +1150,13 @@ impl Canvas {
         if edges.len() < 2 {
             return;
         }
-        let new_positions = equal_length_positions(&positions, &edges);
+        let mut new_positions = equal_length_positions(&positions, &edges);
+        if self.grid_enabled {
+            // Grid intersections take precedence over exact equality after fitting.
+            for position in &mut new_positions {
+                *position = self.snap_position(*position, &[]);
+            }
+        }
         for element in &mut self.elements {
             let (start, end) = element.endpoints();
             for (is_start, position) in [(true, start), (false, end)] {
@@ -1066,10 +1184,15 @@ impl Canvas {
         let new_positions: Vec<_> = previous_positions
             .iter()
             .map(|position| {
-                if horizontal {
+                let aligned = if horizontal {
                     egui::pos2(position.x, center.y)
                 } else {
                     egui::pos2(center.x, position.y)
+                };
+                if self.grid_enabled {
+                    self.snap_position(aligned, &[])
+                } else {
+                    aligned
                 }
             })
             .collect();
@@ -1378,10 +1501,16 @@ impl Canvas {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
                     DrawMode::Line | DrawMode::Resistor => {
-                        self.start = Some(snap_to_endpoint(&self.elements, position, &[]));
+                        self.start = Some(self.snap_position(position, &[]));
                     }
-                    // The arrow starts at its tail, which is intentionally not a snapping end.
-                    DrawMode::PrescribedFlow => self.start = Some(position),
+                    // The arrow tail only snaps when the grid is enabled.
+                    DrawMode::PrescribedFlow => {
+                        self.start = Some(if self.grid_enabled {
+                            self.snap_position(position, &[])
+                        } else {
+                            position
+                        });
+                    }
                     DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
                 }
             }
@@ -1435,10 +1564,8 @@ impl Canvas {
                 .copied()
                 .unwrap_or(position);
             let unsnapped_anchor = anchor_origin + pointer_delta;
-            let target_anchor = can_snap
-                .then(|| {
-                    snap_to_endpoint(&self.elements, unsnapped_anchor, &self.dragged_endpoints)
-                })
+            let target_anchor = (self.grid_enabled || can_snap)
+                .then(|| self.snap_position(unsnapped_anchor, &self.dragged_endpoints))
                 .unwrap_or(unsnapped_anchor);
             let delta = target_anchor - anchor_origin;
             let previous_positions: Vec<_> = self
@@ -1469,7 +1596,7 @@ impl Canvas {
         origin: egui::Vec2,
     ) {
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
-            let end = snap_to_endpoint(&self.elements, position, &[]);
+            let end = self.snap_position(position, &[]);
             match self.draw_mode {
                 DrawMode::Line => {
                     draw_element(painter, Element::Line(start, end).translated(origin))
@@ -1504,7 +1631,7 @@ impl Canvas {
         }
 
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
-            let end = snap_to_endpoint(&self.elements, position, &[]);
+            let end = self.snap_position(position, &[]);
             match self.draw_mode {
                 DrawMode::Line => self.elements.push(Element::Line(start, end)),
                 DrawMode::Resistor => self.elements.push(Element::Resistor(start, end)),
@@ -1642,6 +1769,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grid_snaps_to_intersections_and_restores_endpoint_snapping_when_disabled() {
+        let mut canvas = Canvas::default();
+        canvas.elements.push(Element::Line(
+            egui::pos2(13.0, 17.0),
+            egui::pos2(103.0, 107.0),
+        ));
+        let pointer = egui::pos2(14.0, 16.0);
+        assert_eq!(canvas.snap_position(pointer, &[]), egui::pos2(13.0, 17.0));
+        canvas.grid_enabled = true;
+        assert_eq!(canvas.snap_position(pointer, &[]), egui::pos2(20.0, 20.0));
+        assert_eq!(
+            canvas.snap_position(egui::pos2(47.0, 52.0), &[]),
+            egui::pos2(40.0, 60.0)
+        );
+        canvas.grid_enabled = false;
+        assert_eq!(canvas.snap_position(pointer, &[]), egui::pos2(13.0, 17.0));
+    }
+
+    #[test]
+    fn snap_selected_to_grid_works_with_grid_hidden_and_supports_undo() {
+        let mut canvas = Canvas::default();
+        canvas.elements.push(Element::Resistor(
+            egui::pos2(13.0, 23.0),
+            egui::pos2(87.0, 92.0),
+        ));
+        canvas.labels.push(String::new());
+        canvas.terminal_labels.push(crate::label::NodeLabel {
+            position: egui::pos2(13.0, 23.0),
+            text: "A".into(),
+        });
+        canvas.selected_endpoints.push(DraggedEndpoint {
+            element_index: 0,
+            is_start: true,
+        });
+        canvas.reset_history();
+        let before = canvas.drawing();
+        canvas.snap_selected_to_grid();
+        assert_eq!(
+            canvas.elements[0].endpoints(),
+            (egui::pos2(20.0, 20.0), egui::pos2(87.0, 92.0))
+        );
+        assert_eq!(canvas.terminal_labels[0].position, egui::pos2(20.0, 20.0));
+        assert!(!canvas.grid_enabled);
+        assert_eq!(canvas.selected_endpoints.len(), 1);
+        let after = canvas.drawing();
+        canvas.undo();
+        assert_eq!(canvas.drawing(), before);
+        canvas.redo();
+        assert_eq!(canvas.drawing(), after);
+    }
+
+    #[test]
+    fn grid_toggle_does_not_change_document_or_svg() {
+        let mut canvas = Canvas::default();
+        canvas.elements.push(Element::Line(
+            egui::pos2(20.0, 20.0),
+            egui::pos2(100.0, 80.0),
+        ));
+        canvas.labels.push(String::new());
+        let ctx = egui::Context::default();
+        let export = |canvas: &Canvas| {
+            exporter::svg(
+                &ctx,
+                &canvas.elements,
+                &canvas.labels,
+                &canvas.node_labels,
+                &canvas.terminal_labels,
+                canvas.label_style,
+            )
+        };
+        let drawing = canvas.drawing();
+        let svg = export(&canvas);
+        canvas.grid_enabled = true;
+        assert_eq!(canvas.drawing(), drawing);
+        assert_eq!(export(&canvas), svg);
+    }
+
+    #[test]
     fn undo_redo_restores_drawing_and_saved_state() {
         let mut canvas = Canvas::default();
         let empty = canvas.drawing();
@@ -1683,7 +1888,7 @@ mod tests {
         let mut canvas = Canvas::default();
         canvas.label_style.size = 30.0;
         canvas.record_edit();
-        for (key, expected_size) in [(egui::Key::Z, 18.0), (egui::Key::Y, 30.0)] {
+        for (key, expected_size) in [(egui::Key::Z, 22.0), (egui::Key::Y, 30.0)] {
             let mut input = egui::RawInput::default();
             input.events.push(egui::Event::Key {
                 key,
@@ -1793,6 +1998,55 @@ mod tests {
     }
 
     #[test]
+    fn equal_lengths_snaps_to_grid_and_keeps_junctions_labels_and_undo() {
+        let mut canvas = Canvas::default();
+        canvas.grid_enabled = true;
+        canvas.elements = vec![
+            Element::Resistor(egui::pos2(13.0, 23.0), egui::pos2(103.0, 23.0)),
+            Element::Resistor(egui::pos2(103.0, 23.0), egui::pos2(103.0, 213.0)),
+            Element::Line(egui::pos2(103.0, 23.0), egui::pos2(303.0, 313.0)),
+        ];
+        canvas.labels = vec![String::new(); 3];
+        canvas.selected_endpoints = vec![
+            DraggedEndpoint {
+                element_index: 0,
+                is_start: true,
+            },
+            DraggedEndpoint {
+                element_index: 0,
+                is_start: false,
+            },
+            DraggedEndpoint {
+                element_index: 1,
+                is_start: false,
+            },
+        ];
+        canvas.node_labels.push(crate::label::NodeLabel {
+            position: egui::pos2(103.0, 23.0),
+            text: "A".into(),
+        });
+        canvas.reset_history();
+        let before = canvas.drawing();
+        canvas.equalize_selected_lengths();
+        for endpoint in &canvas.selected_endpoints {
+            let (start, end) = canvas.elements[endpoint.element_index].endpoints();
+            let position = if endpoint.is_start { start } else { end };
+            assert_eq!(position.x % GRID_SPACING, 0.0);
+            assert_eq!(position.y % GRID_SPACING, 0.0);
+        }
+        let junction = canvas.elements[0].endpoints().1;
+        assert_eq!(canvas.elements[1].endpoints().0, junction);
+        assert_eq!(canvas.elements[2].endpoints().0, junction);
+        assert_eq!(canvas.node_labels[0].position, junction);
+        assert_eq!(canvas.elements[2].endpoints().1, egui::pos2(303.0, 313.0));
+        let after = canvas.drawing();
+        canvas.undo();
+        assert_eq!(canvas.drawing(), before);
+        canvas.redo();
+        assert_eq!(canvas.drawing(), after);
+    }
+
+    #[test]
     fn alignment_moves_only_selected_coordinates_and_attached_labels() {
         for horizontal in [true, false] {
             let mut canvas = Canvas::default();
@@ -1836,6 +2090,48 @@ mod tests {
             assert_eq!(canvas.terminal_labels[0].position, expected[0]);
             assert_eq!(canvas.node_labels[0].position, expected[1]);
             assert_eq!(canvas.selected_endpoints, selection);
+        }
+    }
+
+    #[test]
+    fn alignment_snaps_both_coordinates_to_grid_and_supports_undo() {
+        for horizontal in [true, false] {
+            let mut canvas = Canvas::default();
+            canvas.grid_enabled = true;
+            canvas.elements = vec![Element::Resistor(
+                egui::pos2(13.0, 23.0),
+                egui::pos2(87.0, 92.0),
+            )];
+            canvas.labels.push(String::new());
+            canvas.selected_endpoints = vec![
+                DraggedEndpoint {
+                    element_index: 0,
+                    is_start: true,
+                },
+                DraggedEndpoint {
+                    element_index: 0,
+                    is_start: false,
+                },
+            ];
+            canvas.terminal_labels.push(crate::label::NodeLabel {
+                position: egui::pos2(13.0, 23.0),
+                text: "terminal".into(),
+            });
+            canvas.reset_history();
+            let before = canvas.drawing();
+            canvas.align_selected_endpoints(horizontal);
+            let expected = if horizontal {
+                (egui::pos2(20.0, 60.0), egui::pos2(80.0, 60.0))
+            } else {
+                (egui::pos2(60.0, 20.0), egui::pos2(60.0, 100.0))
+            };
+            assert_eq!(canvas.elements[0].endpoints(), expected);
+            assert_eq!(canvas.terminal_labels[0].position, expected.0);
+            let aligned = canvas.drawing();
+            canvas.undo();
+            assert_eq!(canvas.drawing(), before);
+            canvas.redo();
+            assert_eq!(canvas.drawing(), aligned);
         }
     }
 

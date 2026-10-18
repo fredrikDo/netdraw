@@ -36,7 +36,7 @@ impl Default for LabelStyle {
     fn default() -> Self {
         Self {
             font: LabelFont::Inter,
-            size: 18.0,
+            size: 22.0,
         }
     }
 }
@@ -261,7 +261,12 @@ pub fn placements(
         let mut placement = None;
         // These are perpendicular distances from the element's midpoint to the label's center.
         // Start close to the element, then move outward until the label clears the diagram.
-        for distance in [32.0, 50.0, 68.0, 86.0, 104.0] {
+        let initial_distance = if matches!(element, Element::Resistor(..)) {
+            26.0
+        } else {
+            32.0
+        };
+        for distance in [0.0, 18.0, 36.0, 54.0, 72.0].map(|step| initial_distance + step) {
             for side in [1.0, -1.0] {
                 let rect =
                     egui::Rect::from_center_size(center + perpendicular * distance * side, size);
@@ -284,7 +289,7 @@ pub fn placements(
         // its element, choosing the least surprising side rather than hiding it.
         placed.push(placement.or_else(|| {
             Some(Placement {
-                rect: egui::Rect::from_center_size(center + perpendicular * 32.0, size),
+                rect: egui::Rect::from_center_size(center + perpendicular * initial_distance, size),
             })
         }));
     }

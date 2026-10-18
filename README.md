@@ -34,9 +34,11 @@ cargo run
 
 Choose a drawing tool from the toolbar, then drag across the canvas to create an element. Nearby compatible endpoints snap together automatically.
 
+Toggle **Grid** in the toolbar to show a gray grid with 20 px spacing and snap drawing endpoints to its intersections. Moving selected endpoints also snaps the selection anchor to the grid. Use **Snap selected endpoints to grid**, beside the Grid button, to snap each selected endpoint to its nearest intersection even when the grid is hidden. The grid is only a visual aid and is excluded from SVG exports.
+
 Use the selection tool to select and move endpoints. Connected endpoints can be moved together, while the label and erase tools let you annotate or remove parts of the drawing.
 
-Drag a selection box around two or more endpoints, then use **Align horizontally** or **Align vertically** in the toolbar. Alignment uses the center of the selection and keeps the endpoints selected.
+Drag a selection box around two or more endpoints, then use **Align horizontally** or **Align vertically** in the toolbar. Alignment uses the center of the selection and keeps the endpoints selected. When Grid is enabled, aligned endpoints snap to grid intersections. **Equalize connected lengths** also snaps its resulting endpoints to the grid; rounding to intersections can make the final lengths approximate.
 
 The **File** menu provides two separate workflows:
 

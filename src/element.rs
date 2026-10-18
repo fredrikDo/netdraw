@@ -68,8 +68,8 @@ pub const ENDPOINT_RADIUS: f32 = 8.0;
 // Keep terminal ticks identical in the interactive canvas and exported SVG.
 pub const RESISTOR_TERMINAL_LENGTH: f32 = 20.0;
 pub const RESISTOR_ZIG_SEGMENTS: usize = 7;
-// Endpoints within this distance are joined to make circuit connections easy to align.
-const SNAP_DISTANCE: f32 = 12.0;
+// Shared range for endpoint snapping, hover indicators, and selection.
+pub const ENDPOINT_INTERACTION_DISTANCE: f32 = 16.0;
 const ERASE_DISTANCE: f32 = 10.0;
 
 // Check the most recently drawn elements first, matching their visual stacking order.
@@ -77,14 +77,14 @@ pub fn endpoint_at(elements: &[Element], position: egui::Pos2) -> Option<Dragged
     for (element_index, element) in elements.iter().enumerate().rev() {
         let (start, end) = element.endpoints();
 
-        if position.distance(start) <= ENDPOINT_RADIUS * 2.0 {
+        if position.distance(start) <= ENDPOINT_INTERACTION_DISTANCE {
             return Some(DraggedEndpoint {
                 element_index,
                 is_start: true,
             });
         }
 
-        if position.distance(end) <= ENDPOINT_RADIUS * 2.0 {
+        if position.distance(end) <= ENDPOINT_INTERACTION_DISTANCE {
             return Some(DraggedEndpoint {
                 element_index,
                 is_start: false,
@@ -224,7 +224,7 @@ pub fn snap_to_endpoint(
             }
 
             let distance = position.distance(endpoint);
-            if distance <= SNAP_DISTANCE
+            if distance <= ENDPOINT_INTERACTION_DISTANCE
                 && closest.is_none_or(|(_, closest_distance)| distance < closest_distance)
             {
                 closest = Some((endpoint, distance));
