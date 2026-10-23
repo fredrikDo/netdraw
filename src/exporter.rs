@@ -2,11 +2,12 @@ use std::fmt::Write;
 
 use eframe::egui;
 
-use crate::element::{Element, RESISTOR_TERMINAL_LENGTH, RESISTOR_ZIG_SEGMENTS};
+use crate::element::{
+    DIAGRAM_STROKE_WIDTH, Element, JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
+};
 use crate::label;
 
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
-const JUNCTION_NODE_RADIUS: f32 = 3.0;
 const STROKE_MARGIN: f32 = 1.0;
 
 pub fn svg(
@@ -68,13 +69,13 @@ pub fn svg(
     .unwrap();
     writeln!(
         output,
-        r#"  <g fill="none" stroke="black" stroke-linecap="round">"#
+        r#"  <g fill="none" stroke="black" stroke-linecap="round" stroke-linejoin="round">"#
     )
     .unwrap();
 
     for element in elements {
         match *element {
-            Element::Line(start, end) => line(&mut output, start, end, 2.0),
+            Element::Line(start, end) => line(&mut output, start, end, DIAGRAM_STROKE_WIDTH),
             Element::Resistor(start, end) => resistor(&mut output, start, end),
             Element::PrescribedFlow(start, end) => prescribed_flow(&mut output, start, end),
         }
@@ -224,26 +225,12 @@ impl Bounds {
     }
 
     fn include_resistor(&mut self, start: egui::Pos2, end: egui::Pos2) {
-        let offset = end - start;
-        let length = offset.length();
-        if length < 5.0 {
-            return;
-        }
-
-        let direction = offset / length;
-        let perpendicular = egui::Vec2::new(-direction.y, direction.x);
-        let body_length = length.min(80.0);
-        let body_start = start + direction * ((length - body_length) / 2.0);
-        let body_end = body_start + direction * body_length;
-        self.include(start);
-        self.include(end);
-        self.include(body_start);
-        self.include(body_end);
-        for index in 1..RESISTOR_ZIG_SEGMENTS {
-            let center = body_start
-                + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
-            let amplitude = if index % 2 == 1 { 8.0 } else { -8.0 };
-            self.include(center + perpendicular * amplitude);
+        if let Some(points) = resistor_body(start, end) {
+            self.include(start);
+            self.include(end);
+            for point in points {
+                self.include(point);
+            }
         }
     }
 
@@ -282,7 +269,7 @@ impl Bounds {
             }
 
             let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-            let half_length = RESISTOR_TERMINAL_LENGTH / 2.0;
+            let half_length = resistor_half_width(length);
             for position in [start, end] {
                 let connections = all_endpoints
                     .iter()
@@ -419,7 +406,7 @@ fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
         }
 
         let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-        let half_length = RESISTOR_TERMINAL_LENGTH / 2.0;
+        let half_length = resistor_half_width(length);
         for position in [start, end] {
             let connection_count = all_endpoints
                 .iter()
@@ -430,7 +417,7 @@ fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
                     output,
                     position - perpendicular * half_length,
                     position + perpendicular * half_length,
-                    2.0,
+                    DIAGRAM_STROKE_WIDTH,
                 );
             }
         }
@@ -485,30 +472,21 @@ fn line(output: &mut String, start: egui::Pos2, end: egui::Pos2, width: f32) {
 }
 
 fn resistor(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
-    let offset = end - start;
-    let length = offset.length();
-    if length < 5.0 {
+    let Some(points) = resistor_body(start, end) else {
         return;
-    }
-
-    let direction = offset / length;
-    let perpendicular = egui::Vec2::new(-direction.y, direction.x);
-    let body_length = length.min(80.0);
-    let body_start = start + direction * ((length - body_length) / 2.0);
-    let body_end = body_start + direction * body_length;
-    line(output, start, body_start, 1.5);
-    line(output, body_end, end, 1.5);
-
-    let mut path = format!("M {} {}", body_start.x, body_start.y);
-    for index in 1..RESISTOR_ZIG_SEGMENTS {
-        let center =
-            body_start + direction * (body_length * index as f32 / RESISTOR_ZIG_SEGMENTS as f32);
-        let amplitude = if index % 2 == 1 { 8.0 } else { -8.0 };
-        let point = center + perpendicular * amplitude;
+    };
+    line(output, start, points[0], DIAGRAM_STROKE_WIDTH);
+    line(output, *points.last().unwrap(), end, DIAGRAM_STROKE_WIDTH);
+    let mut path = format!("M {} {}", points[0].x, points[0].y);
+    for point in &points[1..] {
         write!(path, " L {} {}", point.x, point.y).unwrap();
     }
-    write!(path, " L {} {}", body_end.x, body_end.y).unwrap();
-    writeln!(output, r#"    <path d="{}" stroke-width="1.5"/>"#, path).unwrap();
+    writeln!(
+        output,
+        r#"    <path d="{}" stroke-width="{}"/>"#,
+        path, DIAGRAM_STROKE_WIDTH
+    )
+    .unwrap();
 }
 
 fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
@@ -521,11 +499,21 @@ fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
     let direction = offset / length;
     let center = start + offset * 0.5;
     let radius = PRESCRIBED_FLOW_RADIUS.min(length / 2.0);
-    line(output, start, center - direction * radius, 2.0);
-    line(output, center + direction * radius, end, 2.0);
+    line(
+        output,
+        start,
+        center - direction * radius,
+        DIAGRAM_STROKE_WIDTH,
+    );
+    line(
+        output,
+        center + direction * radius,
+        end,
+        DIAGRAM_STROKE_WIDTH,
+    );
     writeln!(
         output,
-        r#"    <circle cx="{}" cy="{}" r="{}" fill="white" stroke-width="2"/>"#,
+        r#"    <circle cx="{}" cy="{}" r="{}" fill="white" stroke-width="1"/>"#,
         center.x, center.y, radius
     )
     .unwrap();
@@ -534,20 +522,16 @@ fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
     let arrow_tip = center + direction * (radius * 0.55);
     let perpendicular = egui::Vec2::new(-direction.y, direction.x);
     let arrowhead_base = arrow_tip - direction * (radius * 0.4);
-    let arrowhead_width = radius * 0.3;
-    line(output, arrow_start, arrow_tip, 2.0);
-    line(
+    let arrowhead_width = radius * 0.22;
+    line(output, arrow_start, arrowhead_base, DIAGRAM_STROKE_WIDTH);
+    let left = arrowhead_base + perpendicular * arrowhead_width;
+    let right = arrowhead_base - perpendicular * arrowhead_width;
+    writeln!(
         output,
-        arrow_tip,
-        arrowhead_base + perpendicular * arrowhead_width,
-        2.0,
-    );
-    line(
-        output,
-        arrow_tip,
-        arrowhead_base - perpendicular * arrowhead_width,
-        2.0,
-    );
+        r#"    <polygon points="{},{} {},{} {},{}" fill="black" stroke="none"/>"#,
+        arrow_tip.x, arrow_tip.y, left.x, left.y, right.x, right.y
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -581,7 +565,7 @@ mod tests {
         );
 
         assert!(document.starts_with("<svg"));
-        assert!(document.contains("width=\"124\""));
+        assert!(document.contains("width=\"123\""));
         assert!(document.contains("height=\"38\""));
         assert!(document.contains("<path"));
         assert!(document.contains("<circle"));

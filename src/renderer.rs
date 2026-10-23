@@ -1,12 +1,11 @@
 use eframe::egui;
 
 use crate::element::{
-    ENDPOINT_INTERACTION_DISTANCE, ENDPOINT_RADIUS, Element, RESISTOR_TERMINAL_LENGTH,
-    RESISTOR_ZIG_SEGMENTS,
+    DIAGRAM_STROKE_WIDTH, ENDPOINT_INTERACTION_DISTANCE, ENDPOINT_RADIUS, Element,
+    JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
 };
 use crate::label::{LabelStyle, Placement};
 
-const JUNCTION_NODE_RADIUS: f32 = 3.0;
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 
 pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
@@ -39,7 +38,10 @@ pub fn draw_labels(
 pub fn draw_element(painter: &egui::Painter, element: Element) {
     match element {
         Element::Line(start, end) => {
-            painter.line_segment([start, end], egui::Stroke::new(1.5, egui::Color32::BLACK));
+            painter.line_segment(
+                [start, end],
+                egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK),
+            );
         }
         Element::Resistor(start, end) => draw_resistor(painter, start, end),
         Element::PrescribedFlow(start, end) => draw_prescribed_flow(painter, start, end),
@@ -130,7 +132,7 @@ pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[
         }
 
         let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-        let half_length = RESISTOR_TERMINAL_LENGTH / 2.0;
+        let half_length = resistor_half_width(length);
 
         for position in [*start, *end] {
             let connection_count = all_endpoints
@@ -143,7 +145,7 @@ pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[
                         position - perpendicular * half_length,
                         position + perpendicular * half_length,
                     ],
-                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                    egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK),
                 );
             }
         }
@@ -151,45 +153,18 @@ pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[
 }
 
 pub fn draw_resistor(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
-    let stroke = egui::Stroke::new(1.5, egui::Color32::BLACK);
-    let offset = end - start;
-    let length = offset.length();
-
-    // Don't draw a resistor if the points are almost identical.
-    if length < 5.0 {
+    let Some(points) = resistor_body(start, end) else {
         return;
-    }
-
-    let direction = offset / length;
-    let perpendicular = egui::Vec2::new(-direction.y, direction.x);
-    let body_length = length.min(80.0);
-    let body_start = start + direction * ((length - body_length) / 2.0);
-    let body_end = body_start + direction * body_length;
-
-    // Lead wires connect the endpoints to the centered zig-zag body.
-    painter.line_segment([start, body_start], stroke);
-    painter.line_segment([body_end, end], stroke);
-
-    let amplitude = 8.0;
-    let mut points = Vec::with_capacity(RESISTOR_ZIG_SEGMENTS + 1);
-    points.push(body_start);
-
-    for i in 1..RESISTOR_ZIG_SEGMENTS {
-        let center =
-            body_start + direction * (body_length * i as f32 / RESISTOR_ZIG_SEGMENTS as f32);
-        let amplitude = if i % 2 == 1 { amplitude } else { -amplitude };
-        points.push(center + perpendicular * amplitude);
-    }
-
-    points.push(body_end);
-    for pair in points.windows(2) {
-        painter.line_segment([pair[0], pair[1]], stroke);
-    }
+    };
+    let stroke = egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK);
+    painter.line_segment([start, points[0]], stroke);
+    painter.line_segment([*points.last().unwrap(), end], stroke);
+    painter.add(egui::Shape::line(points, stroke));
 }
 
 // Draw an IEEE-style independent current source: lead wires, a centered circle, and an arrow.
 fn draw_prescribed_flow(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
-    let stroke = egui::Stroke::new(1.5, egui::Color32::BLACK);
+    let stroke = egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK);
     let offset = end - start;
     let length = offset.length();
 
@@ -212,16 +187,17 @@ fn draw_prescribed_flow(painter: &egui::Painter, start: egui::Pos2, end: egui::P
     let arrow_tip = center + direction * (radius * 0.55);
     let perpendicular = egui::Vec2::new(-direction.y, direction.x);
     let arrowhead_length = radius * 0.4;
-    let arrowhead_width = radius * 0.3;
+    let arrowhead_width = radius * 0.22;
     let arrowhead_base = arrow_tip - direction * arrowhead_length;
 
-    painter.line_segment([arrow_start, arrow_tip], stroke);
-    painter.line_segment(
-        [arrow_tip, arrowhead_base + perpendicular * arrowhead_width],
-        stroke,
-    );
-    painter.line_segment(
-        [arrow_tip, arrowhead_base - perpendicular * arrowhead_width],
-        stroke,
-    );
+    painter.line_segment([arrow_start, arrowhead_base], stroke);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            arrow_tip,
+            arrowhead_base + perpendicular * arrowhead_width,
+            arrowhead_base - perpendicular * arrowhead_width,
+        ],
+        egui::Color32::BLACK,
+        egui::Stroke::NONE,
+    ));
 }

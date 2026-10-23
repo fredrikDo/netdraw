@@ -65,9 +65,45 @@ pub struct DraggedEndpoint {
 
 // Handles are drawn at this radius; their larger hit area makes them easier to grab.
 pub const ENDPOINT_RADIUS: f32 = 8.0;
-// Keep terminal ticks identical in the interactive canvas and exported SVG.
-pub const RESISTOR_TERMINAL_LENGTH: f32 = 20.0;
+const RESISTOR_BODY_LENGTH: f32 = 60.0;
+const RESISTOR_HALF_WIDTH: f32 = 10.0;
+
+// The boundary tick spans exactly the same transverse width as the zigzag,
+// including when a short resistor is scaled down.
+pub fn resistor_half_width(length: f32) -> f32 {
+    RESISTOR_HALF_WIDTH * (length / RESISTOR_BODY_LENGTH).min(1.0)
+}
 pub const RESISTOR_ZIG_SEGMENTS: usize = 7;
+pub const DIAGRAM_STROKE_WIDTH: f32 = 1.0;
+pub const JUNCTION_NODE_RADIUS: f32 = 2.0;
+
+/// Three zigzag cycles with half-length first/last legs, giving every leg
+/// the same slope. Shared by the canvas, SVG export, and export bounds.
+pub fn resistor_body(start: egui::Pos2, end: egui::Pos2) -> Option<Vec<egui::Pos2>> {
+    let offset = end - start;
+    let length = offset.length();
+    if length < 5.0 {
+        return None;
+    }
+    let direction = offset / length;
+    let perpendicular = egui::vec2(-direction.y, direction.x);
+    let body_length = length.min(RESISTOR_BODY_LENGTH);
+    let amplitude = resistor_half_width(length);
+    let body_start = start + direction * ((length - body_length) / 2.0);
+    let mut points = Vec::with_capacity(RESISTOR_ZIG_SEGMENTS + 1);
+    points.push(body_start);
+    for index in 0..RESISTOR_ZIG_SEGMENTS - 1 {
+        let fraction = (index as f32 + 0.5) / (RESISTOR_ZIG_SEGMENTS - 1) as f32;
+        let height = if index % 2 == 0 {
+            -amplitude
+        } else {
+            amplitude
+        };
+        points.push(body_start + direction * (body_length * fraction) + perpendicular * height);
+    }
+    points.push(body_start + direction * body_length);
+    Some(points)
+}
 // Shared range for endpoint snapping, hover indicators, and selection.
 pub const ENDPOINT_INTERACTION_DISTANCE: f32 = 16.0;
 const ERASE_DISTANCE: f32 = 10.0;
@@ -263,6 +299,28 @@ fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resistor_has_uniform_slopes_and_scales_when_short() {
+        for (end, scale) in [(egui::pos2(100.0, 0.0), 1.0), (egui::pos2(30.0, 0.0), 0.5)] {
+            let points = resistor_body(egui::Pos2::ZERO, end).unwrap();
+            assert_eq!(points.len(), 8);
+            assert_eq!(points[0].y, 0.0);
+            assert_eq!(points[7].y, 0.0);
+            for point in &points[1..7] {
+                assert_eq!(point.y.abs(), 10.0 * scale);
+            }
+            for pair in points.windows(2) {
+                let delta = pair[1] - pair[0];
+                assert!((delta.y.abs() / delta.x - 2.0).abs() < 0.001);
+            }
+            let vertical = resistor_body(egui::Pos2::ZERO, egui::pos2(0.0, end.x)).unwrap();
+            for (horizontal, vertical) in points.iter().zip(vertical) {
+                assert_eq!(vertical, egui::pos2(-horizontal.y, horizontal.x));
+            }
+        }
+        assert!(resistor_body(egui::Pos2::ZERO, egui::Pos2::ZERO).is_none());
+    }
 
     #[test]
     fn box_selection_returns_every_enclosed_endpoint() {
