@@ -1,3 +1,8 @@
+//! Desktop UI and interaction state.
+//!
+//! Persistent geometry is copied into `Drawing` snapshots; tools, selection,
+//! dialogs, and clipboard ownership belong only to this controller.
+
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +32,7 @@ const SELECTED_TOOL_BORDER: egui::Color32 = egui::Color32::from_rgb(125, 195, 25
 
 #[derive(Clone, Copy)]
 enum ToolIcon {
+    Solve,
     Camera,
     Grid,
     SnapToGrid,
@@ -57,6 +63,7 @@ pub fn run() -> eframe::Result<()> {
     })
 }
 
+/// UI owner. `drawing()` extracts the persistent subset for pure downstream operations.
 struct Canvas {
     elements: Vec<Element>,
     labels: Vec<String>,
@@ -88,6 +95,7 @@ struct Canvas {
     history_drawing: Drawing,
     undo_stack: Vec<Drawing>,
     redo_stack: Vec<Drawing>,
+    solve_result: Option<Result<String, String>>,
     file_status: Option<String>,
     pending_file_action: Option<FileAction>,
     allow_close: bool,
@@ -138,6 +146,7 @@ impl Default for Canvas {
             history_drawing: Drawing::empty(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            solve_result: None,
             file_status: None,
             pending_file_action: None,
             allow_close: false,
@@ -156,6 +165,7 @@ impl Canvas {
         self.handle_window_close(ui.ctx());
         self.show_menu_bar(ui);
         self.show_toolbar(ui);
+        self.show_solve_dialog(ui.ctx());
         self.show_export_dialog(ui.ctx());
         self.show_label_style_dialog(ui.ctx());
         self.show_unsaved_changes_dialog(ui.ctx());
@@ -452,6 +462,7 @@ impl Canvas {
         });
     }
 
+    /// Snapshot only document state; exclude interaction state and calculated results.
     fn drawing(&self) -> Drawing {
         Drawing {
             elements: self.elements.clone(),
@@ -462,6 +473,7 @@ impl Canvas {
         }
     }
 
+    /// Commit one completed editing gesture, cap history, and invalidate the redo branch.
     fn record_edit(&mut self) {
         let drawing = self.drawing();
         if drawing != self.history_drawing {
@@ -514,6 +526,7 @@ impl Canvas {
         self.drawing() != self.clean_drawing
     }
 
+    /// Defer destructive document replacement until unsaved changes are resolved.
     fn request_file_action(&mut self, action: FileAction, ctx: &egui::Context) {
         if self.is_dirty() {
             self.pending_file_action = Some(action);
@@ -600,6 +613,7 @@ impl Canvas {
         self.save_to(path)
     }
 
+    /// Write a temporary sibling first; mark the document clean only after rename succeeds.
     fn save_to(&mut self, path: PathBuf) -> bool {
         let drawing = self.drawing();
         let result = drawing.to_json().and_then(|json| {
@@ -655,6 +669,7 @@ impl Canvas {
         self.file_status = Some(String::from("New drawing"));
     }
 
+    /// Replace persistent state and clear handles/indices belonging to the previous geometry.
     fn apply_drawing(&mut self, drawing: Drawing) {
         self.elements = drawing.elements;
         self.labels = drawing.labels;
@@ -841,6 +856,29 @@ impl Canvas {
         });
     }
 
+    /// Display the last explicitly requested solve; edits do not silently recompute it.
+    fn show_solve_dialog(&mut self, ctx: &egui::Context) {
+        let Some(result) = &self.solve_result else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Node expression").open(&mut open).default_width(560.0).show(ctx, |ui| {
+            match result {
+                Ok(expression) => {
+                    ui.label("Expression for the network as it was when Solve was clicked:");
+                    let mut text = expression.clone();
+                    ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(5));
+                    if ui.button("Copy expression").clicked() { ctx.copy_text(expression.clone()); }
+                    ui.label("Assumes positive, finite conductances. Flow arrows inject positive flow. Terminal labels are known pressures; other labels are literal symbols.");
+                }
+                Err(message) => { ui.label(message); }
+            }
+        });
+        if !open {
+            self.solve_result = None;
+        }
+    }
+
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if Self::tool_button(ui, self.grid_enabled, ToolIcon::Grid, "Grid: show and snap")
@@ -862,7 +900,7 @@ impl Canvas {
             });
             ui.separator();
             self.select_mode(ui, DrawMode::Line, ToolIcon::Line, "Line");
-            self.select_mode(ui, DrawMode::Resistor, ToolIcon::Resistor, "Resistance");
+            self.select_mode(ui, DrawMode::Resistor, ToolIcon::Resistor, "Conductance");
             self.select_mode(
                 ui,
                 DrawMode::PrescribedFlow,
@@ -893,6 +931,12 @@ impl Canvas {
                     self.equalize_selected_lengths();
                 }
             });
+            if Self::tool_button(ui, false, ToolIcon::Solve, "Solve selected node").clicked() {
+                self.solve_result = Some(crate::network_solver::solve_selected(
+                    &self.drawing(),
+                    &self.selected_endpoints,
+                ));
+            }
             self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
             ui.separator();
             self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
@@ -990,6 +1034,15 @@ impl Canvas {
         let right = egui::pos2(rect.right(), center.y);
 
         match icon {
+            ToolIcon::Solve => {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "=",
+                    egui::FontId::proportional(25.0),
+                    color,
+                );
+            }
             ToolIcon::Camera => {
                 let body = egui::Rect::from_min_max(
                     center + egui::vec2(-10.0, -5.0),
@@ -1195,6 +1248,7 @@ impl Canvas {
         }
     }
 
+    /// Fit selected connections toward equal lengths; loops may require angle changes.
     fn equalize_selected_lengths(&mut self) {
         if self.selected_endpoints.len() < 2 {
             return;
@@ -1242,6 +1296,7 @@ impl Canvas {
         self.update_endpoint_labels(&positions, &new_positions);
     }
 
+    /// Align selected handles and move their position-attached labels with them.
     fn align_selected_endpoints(&mut self, horizontal: bool) {
         if self.selected_endpoints.len() < 2 {
             return;
@@ -1812,6 +1867,7 @@ fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::St
     }
 }
 
+/// Replace a character-based UI selection using UTF-8 byte offsets, then restore the cursor.
 fn insert_label_marker(ctx: &egui::Context, id: egui::Id, label: &mut String, marker: char) {
     let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
     let fallback = egui::text::CCursor::new(label.chars().count());

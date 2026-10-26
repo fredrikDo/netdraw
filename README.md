@@ -1,12 +1,22 @@
 # NetDraw
 
-NetDraw is a lightweight desktop application for creating and editing network diagrams. It provides a focused canvas for drawing connected elements, labeling them, and exporting clean figures for reports and presentations.
+NetDraw is a Rust desktop application for drawing conductance networks, solving
+node values symbolically, and exporting clean diagrams for reports and presentations.
+It can model steady linear heat, pressure, or similar potential-and-flux networks.
 
 > **Pre-release:** NetDraw is currently under active development. Features, behavior, and the `.netdraw` file format may change between releases.
 
+## Documentation
+
+- [Solving networks](docs/solving.md): workflow, equations, examples, limits, and errors.
+- [Development and architecture](docs/architecture.md): module responsibilities and solver algorithms.
+- [Project file format](docs/file-format.md): JSON schema, validation, and compatibility.
+- [Bundled fonts](assets/fonts/README.md): sources, licenses, and replacement mappings.
+
 ## Features
 
-- Draw lines, resistors, and prescribed-flow elements
+- Draw ideal connections, conductance zigzags, and prescribed-flow elements
+- Solve a selected node symbolically using exact arithmetic, with up to six unknown nodes
 - Snap endpoints together to create connected networks
 - Select and move individual or connected endpoints
 - Add labels to elements, junctions, and unconnected terminals
@@ -41,6 +51,10 @@ Use the selection tool to select and move endpoints. Connected endpoints can be 
 
 Drag a selection box around two or more endpoints, then use **Align horizontally** or **Align vertically** in the toolbar. Alignment uses the center of the selection and keeps the endpoints selected. When Grid is enabled, aligned endpoints snap to grid intersections. **Equalize connected lengths** also snaps its resulting endpoints to the grid; rounding to intersections can make the final lengths approximate.
 
+Use **Edit → Undo** (`Ctrl+Z`) and **Edit → Redo** (`Ctrl+Y`) to reverse or restore
+completed edits. With endpoints selected, `Delete` or `Backspace` removes the
+attached elements; text fields handle their own editing keys while focused.
+
 The **File** menu provides two separate workflows:
 
 - **Save** and **Open** use the editable `.netdraw` project format.
@@ -49,6 +63,47 @@ The **File** menu provides two separate workflows:
 Click **Copy image** to paste a tightly cropped image of the complete drawing, including labels, into a document. The image has a white background and excludes the grid, selection handles, and unused canvas. Keep NetDraw open until you paste on Linux; clipboard persistence after closing depends on your clipboard manager. Linux supports X11 and Wayland compositors with clipboard data-control support.
 
 Keep the `.netdraw` file if you expect to edit a diagram again; an exported SVG is intended as final output.
+
+## Solving a node
+
+See the [solver guide](docs/solving.md) for worked examples and troubleshooting.
+
+
+Label every conductance and prescribed-flow arrow in the selected connected network.
+Label each free terminal with its known pressure (for example `P_in` or `P_out`).
+Labels are literal symbolic names, not parsed formulas or numerical values.
+Use the selection tool to mark one node, then click **Solve selected node** (`=`)
+in the toolbar. The result window shows a selectable expression and a copy button.
+A node label is optional and names the result when present.
+
+Zigzag element labels represent conductance `G`: edge flux is `G * (p_i - p_j)`.
+Prescribed flux `Q` is an independent source, so conservation gives
+`sum(G_ij * (p_i - p_j)) = Q_i`. For one conductance connected to a known
+boundary, the result is `p = p_boundary + Q / G`.
+Existing drawings retain their labels; labels formerly used as resistance names
+must now be interpreted or relabeled as conductances for solving.
+
+The solver assumes positive, finite conductances, conservation of flow, and positive
+injection at each flow arrow tip. Plain lines are ideal connections between their
+endpoints; crossings do not connect unless endpoints coincide. Free wire endpoints
+can also be labeled as pressure boundaries. Nodes joined by wires count as one node.
+
+The selected connected network may contain up to six unknown pressure nodes and
+must have a known pressure boundary. Unrelated disconnected drawings are ignored.
+Exact symbolic arithmetic runs locally in Rust. Simplification combines terms and
+cancels numeric, monomial, and shared polynomial factors encountered during
+elimination. Cancellation uses exact integer polynomial division; general
+polynomial factoring is not included. Complex expressions may reach a size limit
+before the node limit.
+
+When several boundaries share a label, the most frequent shared value becomes the
+reference. The result is expressed as that reference plus weighted boundary
+differences and independent prescribed fluxes. For example, boundaries `T_0` and
+`T_e` can give `T = T_0 + alpha*(T_e - T_0)`, with the conductance expression for
+`alpha` written directly in the result. Sums, products, and powers are preserved
+when they give a shorter expression than the expanded result.
+
+The result is a snapshot; click Solve again after editing the drawing.
 
 ## Application icon
 
@@ -84,10 +139,16 @@ This repository contains an early preview intended for testing and feedback. Bef
 
 ## Development
 
+See [development and architecture](docs/architecture.md) for the code map, invariants,
+and symbolic solving pipeline. The project keeps UI handling, topology conversion,
+exact algebra, and expression formatting in separate modules.
+
 Run the test suite with:
 
 ```sh
 cargo test
+cargo fmt --check
+cargo doc --no-deps --document-private-items
 ```
 
 The application is built with [egui/eframe](https://github.com/emilk/egui) and uses [rfd](https://github.com/PolyMeilex/rfd) for native file dialogs.

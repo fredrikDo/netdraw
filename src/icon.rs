@@ -1,3 +1,5 @@
+//! Window icon generated from the bundled SVG without runtime file access.
+
 use eframe::egui;
 
 pub fn app_icon() -> egui::IconData {

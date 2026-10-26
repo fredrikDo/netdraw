@@ -1,3 +1,8 @@
+//! egui painting for diagram shapes, labels, and editing overlays.
+//!
+//! Callers supply screen-space geometry. Exporting is separate, but shares shape
+//! and text-layout helpers so canvas and output stay consistent.
+
 use eframe::egui;
 
 use crate::element::{

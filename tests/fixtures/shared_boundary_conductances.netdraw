@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "elements": [
+    {
+      "type": "resistor",
+      "start": [
+        600.0,
+        300.0
+      ],
+      "end": [
+        760.0,
+        300.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        600.0,
+        480.0
+      ],
+      "end": [
+        600.0,
+        300.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        600.0,
+        300.0
+      ],
+      "end": [
+        420.0,
+        300.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        420.0,
+        300.0
+      ],
+      "end": [
+        420.0,
+        480.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        420.0,
+        300.0
+      ],
+      "end": [
+        260.0,
+        300.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        760.0,
+        300.0
+      ],
+      "end": [
+        760.0,
+        480.0
+      ]
+    }
+  ],
+  "labels": [
+    "K_h",
+    "K_a",
+    "K_t",
+    "K_a",
+    "K_h",
+    "K_C"
+  ],
+  "node_labels": [
+    {
+      "position": [
+        760.0,
+        300.0
+      ],
+      "text": "T"
+    }
+  ],
+  "terminal_labels": [
+    {
+      "position": [
+        600.0,
+        480.0
+      ],
+      "text": "T_0"
+    },
+    {
+      "position": [
+        420.0,
+        480.0
+      ],
+      "text": "T_0"
+    },
+    {
+      "position": [
+        760.0,
+        480.0
+      ],
+      "text": "T_0"
+    },
+    {
+      "position": [
+        260.0,
+        300.0
+      ],
+      "text": "T_e"
+    }
+  ],
+  "label_style": {
+    "font": "inter",
+    "size": 22.0
+  }
+}

@@ -1,3 +1,8 @@
+//! Bundled typography, display-only label scripts, and collision-aware placement.
+//!
+//! Geometry and exports share these measurements. Script notation changes
+//! appearance only; it never parses a symbolic solver expression.
+
 use eframe::egui;
 use std::sync::Arc;
 
@@ -54,6 +59,7 @@ impl LabelStyle {
         self.galley(ctx, text).size() + egui::vec2(4.0, 4.0)
     }
 
+    /// Use the same script spans and embedded font metrics for canvas and export layout.
     pub fn galley(self, ctx: &egui::Context, text: &str) -> Arc<egui::Galley> {
         let mut job = egui::text::LayoutJob::default();
         for span in parse_label(text) {
@@ -80,6 +86,7 @@ impl LabelStyle {
     }
 }
 
+/// Split display scripts and escapes into spans; the solver keeps the original literal name.
 pub fn parse_label(input: &str) -> Vec<LabelSpan> {
     let mut spans = Vec::new();
     let mut normal = String::new();
@@ -180,6 +187,7 @@ impl LabelFont {
         }
     }
 
+    /// Return embedded font data; no platform font installation is required.
     pub fn bytes(self) -> &'static [u8] {
         match self {
             Self::Inter => include_bytes!("../assets/fonts/Inter-Regular.ttf"),
@@ -199,6 +207,7 @@ impl LabelFont {
     }
 }
 
+/// Register named font families while retaining egui fallback glyph coverage.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut definitions = egui::FontDefinitions::default();
     let fallbacks = definitions
@@ -221,17 +230,20 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(definitions);
 }
 
+/// Measured label rectangle, in the coordinate space supplied by the caller.
 #[derive(Clone, Copy)]
 pub struct Placement {
     pub rect: egui::Rect,
 }
 
+/// Position-attached literal label shared by internal nodes and boundary terminals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeLabel {
     pub position: egui::Pos2,
     pub text: String,
 }
 
+/// Place element labels in element order; empty labels retain a `None` entry.
 pub fn placements(
     ctx: &egui::Context,
     elements: &[Element],
@@ -297,6 +309,7 @@ pub fn placements(
     placed
 }
 
+/// Place node labels after element labels, trying nearby directions before a fallback.
 pub fn node_placements(
     ctx: &egui::Context,
     elements: &[Element],
@@ -358,6 +371,7 @@ pub fn node_placements(
     node_placements
 }
 
+/// Place boundary labels along an attached zigzag axis, avoiding occupied rectangles.
 pub fn terminal_placements(
     ctx: &egui::Context,
     elements: &[Element],

@@ -1,10 +1,18 @@
+//! Drawing geometry, endpoint interaction, and visual node discovery.
+//!
+//! `Resistor` names the historical zigzag shape; the solver interprets its label
+//! as conductance. Visual junction markers do not define mathematical connectivity.
+
 use eframe::egui;
 
 // Every completed item on the canvas is stored with its two editable endpoints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Element {
+    /// Ideal connection between endpoints during solving.
     Line(egui::Pos2, egui::Pos2),
+    /// Zigzag geometry whose solver label is conductance, despite this legacy name.
     Resistor(egui::Pos2, egui::Pos2),
+    /// Independent positive injection at the end endpoint; the start is decorative.
     PrescribedFlow(egui::Pos2, egui::Pos2),
 }
 
@@ -57,6 +65,7 @@ pub enum DrawMode {
     Erase,
 }
 
+/// Element index plus endpoint side; valid only while the element ordering is unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DraggedEndpoint {
     pub element_index: usize,
@@ -156,6 +165,7 @@ pub fn overlapping_endpoints(
         .collect()
 }
 
+/// Collect editable handles inside a selection rectangle in canvas coordinates.
 pub fn endpoints_in_rect(elements: &[Element], rect: egui::Rect) -> Vec<DraggedEndpoint> {
     elements
         .iter()
@@ -210,28 +220,27 @@ pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
     positions
 }
 
+// Free wire ends can also carry prescribed pressure boundary labels.
 pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui::Pos2> {
-    let all_endpoints: Vec<_> = elements
+    let endpoints: Vec<_> = elements
         .iter()
         .flat_map(|element| {
-            let (start, end) = element.endpoints();
-            [start, end]
+            let (a, b) = element.endpoints();
+            if matches!(element, Element::PrescribedFlow(..)) {
+                vec![b]
+            } else {
+                vec![a, b]
+            }
         })
         .collect();
-
-    elements
+    endpoints
         .iter()
-        .filter_map(|element| match element {
-            Element::Resistor(start, end) => Some([*start, *end]),
-            _ => None,
-        })
-        .flatten()
-        .filter(|position| {
-            all_endpoints
-                .iter()
-                .filter(|other| **other == *position)
-                .count()
-                == 1
+        .copied()
+        .filter(|p| {
+            endpoints.iter().filter(|q| *q == p).count() == 1
+                && !elements
+                    .iter()
+                    .any(|e| matches!(e, Element::PrescribedFlow(_,tip) if tip == p))
         })
         .collect()
 }

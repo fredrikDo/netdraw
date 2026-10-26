@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "elements": [
+    {
+      "type": "resistor",
+      "start": [
+        240.0,
+        220.0
+      ],
+      "end": [
+        440.0,
+        220.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        640.0,
+        220.0
+      ],
+      "end": [
+        440.0,
+        220.0
+      ]
+    },
+    {
+      "type": "resistor",
+      "start": [
+        201.00307,
+        370.66498
+      ],
+      "end": [
+        240.0,
+        220.0
+      ]
+    }
+  ],
+  "labels": [
+    "K_1",
+    "K_2",
+    "K_1"
+  ],
+  "node_labels": [
+    {
+      "position": [
+        440.0,
+        220.0
+      ],
+      "text": "T"
+    }
+  ],
+  "terminal_labels": [
+    {
+      "position": [
+        640.0,
+        220.0
+      ],
+      "text": "T_1"
+    },
+    {
+      "position": [
+        201.00307,
+        370.66498
+      ],
+      "text": "T_3"
+    }
+  ],
+  "label_style": {
+    "font": "inter",
+    "size": 22.0
+  }
+}

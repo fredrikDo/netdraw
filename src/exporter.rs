@@ -1,3 +1,8 @@
+//! Cropped SVG generation and clipboard rasterization.
+//!
+//! Export consumes drawing data, not canvas UI state, so grid lines and selection
+//! handles cannot leak into output. Bounds include labels and shape decorations.
+
 use std::fmt::Write;
 
 use eframe::egui;
@@ -10,6 +15,7 @@ use crate::label;
 const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 const STROKE_MARGIN: f32 = 1.0;
 
+/// Export the complete drawing with embedded font data and tightly cropped bounds.
 pub fn svg(
     ctx: &egui::Context,
     elements: &[Element],
@@ -106,6 +112,8 @@ pub fn svg(
 }
 
 /// Rasterize the same tightly cropped, clean figure used by SVG export.
+/// Rasterize the shared SVG at two pixels per canvas point on an opaque white background.
+/// Reject images above 32 million pixels before allocating the raster buffer.
 pub fn image(
     ctx: &egui::Context,
     elements: &[Element],
@@ -158,6 +166,7 @@ pub fn image(
     Ok(pixmap)
 }
 
+/// Geometry and text extents, including stroke margins and terminal decorations.
 struct Bounds {
     min: egui::Pos2,
     max: egui::Pos2,

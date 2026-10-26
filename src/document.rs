@@ -1,3 +1,8 @@
+//! Versioned drawing snapshots and JSON conversion.
+//!
+//! Saved types deliberately avoid egui internals. Loading validates structural
+//! integrity; mathematical validation belongs to `network_solver`.
+
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +13,8 @@ use crate::{
 
 const CURRENT_VERSION: u32 = 1;
 
+/// Persistent document state shared by saving, history, export, and solving.
+/// `labels[i]` must describe `elements[i]`; position labels use canvas coordinates.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drawing {
     pub elements: Vec<Element>,
@@ -18,6 +25,7 @@ pub struct Drawing {
 }
 
 impl Drawing {
+    /// Construct a blank document with the default label typography.
     pub fn empty() -> Self {
         Self {
             elements: Vec::new(),
@@ -28,11 +36,13 @@ impl Drawing {
         }
     }
 
+    /// Encode the current schema without touching the filesystem.
     pub fn to_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&SavedDrawing::from(self))
             .map_err(|error| format!("Could not encode drawing: {error}"))
     }
 
+    /// Decode and validate a supported document; incomplete networks are allowed.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let saved: SavedDrawing =
             serde_json::from_str(json).map_err(|error| format!("Invalid NetDraw file: {error}"))?;
@@ -129,6 +139,7 @@ impl TryFrom<SavedDrawing> for Drawing {
 }
 
 impl Drawing {
+    /// Reject invalid geometry/typography before it reaches rendering or hit testing.
     fn validate(&self) -> Result<(), String> {
         let positions = self
             .elements
