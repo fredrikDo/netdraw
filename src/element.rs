@@ -8,8 +8,6 @@ use eframe::egui;
 // Every completed item on the canvas is stored with its two editable endpoints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Element {
-    /// Ideal connection between endpoints during solving.
-    Line(egui::Pos2, egui::Pos2),
     /// Zigzag geometry whose solver label is conductance, despite this legacy name.
     Resistor(egui::Pos2, egui::Pos2),
     /// Independent positive injection at the end endpoint; the start is decorative.
@@ -19,18 +17,14 @@ pub enum Element {
 impl Element {
     pub fn endpoints(&self) -> (egui::Pos2, egui::Pos2) {
         match self {
-            Self::Line(start, end)
-            | Self::Resistor(start, end)
-            | Self::PrescribedFlow(start, end) => (*start, *end),
+            Self::Resistor(start, end) | Self::PrescribedFlow(start, end) => (*start, *end),
         }
     }
 
     pub fn move_endpoint(&mut self, is_start: bool, position: egui::Pos2) {
         // Two-terminal elements share the same editable geometry.
         match self {
-            Self::Line(start, end)
-            | Self::Resistor(start, end)
-            | Self::PrescribedFlow(start, end) => {
+            Self::Resistor(start, end) | Self::PrescribedFlow(start, end) => {
                 if is_start {
                     *start = position;
                 } else {
@@ -47,7 +41,6 @@ impl Element {
 
     pub fn translated(self, offset: egui::Vec2) -> Self {
         match self {
-            Self::Line(start, end) => Self::Line(start + offset, end + offset),
             Self::Resistor(start, end) => Self::Resistor(start + offset, end + offset),
             Self::PrescribedFlow(start, end) => Self::PrescribedFlow(start + offset, end + offset),
         }
@@ -57,7 +50,6 @@ impl Element {
 // Selects which kind of element a drag on empty canvas space creates.
 #[derive(Clone, Copy, PartialEq)]
 pub enum DrawMode {
-    Line,
     Resistor,
     PrescribedFlow,
     Select,
@@ -220,27 +212,30 @@ pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
     positions
 }
 
-// Free wire ends can also carry prescribed pressure boundary labels.
+/// Resistor endpoints shared with no other resistor endpoint or arrow tip. These are
+/// the only places terminal ticks and pressure-boundary labels appear, and the solver
+/// requires a label at each one. Arrow tails are decorative and never connect.
 pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui::Pos2> {
-    let endpoints: Vec<_> = elements
+    let connections: Vec<_> = elements
         .iter()
-        .flat_map(|element| {
-            let (a, b) = element.endpoints();
-            if matches!(element, Element::PrescribedFlow(..)) {
-                vec![b]
-            } else {
-                vec![a, b]
-            }
+        .flat_map(|element| match *element {
+            Element::Resistor(start, end) => vec![start, end],
+            Element::PrescribedFlow(_, tip) => vec![tip],
         })
         .collect();
-    endpoints
+    elements
         .iter()
-        .copied()
-        .filter(|p| {
-            endpoints.iter().filter(|q| *q == p).count() == 1
-                && !elements
-                    .iter()
-                    .any(|e| matches!(e, Element::PrescribedFlow(_,tip) if tip == p))
+        .filter_map(|element| match *element {
+            Element::Resistor(start, end) => Some([start, end]),
+            Element::PrescribedFlow(..) => None,
+        })
+        .flatten()
+        .filter(|position| {
+            connections
+                .iter()
+                .filter(|other| *other == position)
+                .count()
+                == 1
         })
         .collect()
 }
@@ -334,7 +329,7 @@ mod tests {
     #[test]
     fn box_selection_returns_every_enclosed_endpoint() {
         let elements = [
-            Element::Line(egui::pos2(10.0, 10.0), egui::pos2(100.0, 100.0)),
+            Element::Resistor(egui::pos2(10.0, 10.0), egui::pos2(100.0, 100.0)),
             Element::Resistor(egui::pos2(20.0, 20.0), egui::pos2(120.0, 120.0)),
         ];
 

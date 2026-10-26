@@ -9,6 +9,7 @@ use eframe::egui;
 
 use crate::element::{
     DIAGRAM_STROKE_WIDTH, Element, JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
+    unconnected_resistor_terminal_positions,
 };
 use crate::label;
 
@@ -81,7 +82,6 @@ pub fn svg(
 
     for element in elements {
         match *element {
-            Element::Line(start, end) => line(&mut output, start, end, DIAGRAM_STROKE_WIDTH),
             Element::Resistor(start, end) => resistor(&mut output, start, end),
             Element::PrescribedFlow(start, end) => prescribed_flow(&mut output, start, end),
         }
@@ -186,10 +186,6 @@ impl Bounds {
 
         for element in elements {
             match *element {
-                Element::Line(start, end) => {
-                    bounds.include(start);
-                    bounds.include(end);
-                }
                 Element::Resistor(start, end) => bounds.include_resistor(start, end),
                 Element::PrescribedFlow(start, end) => bounds.include_prescribed_flow(start, end),
             }
@@ -259,13 +255,7 @@ impl Bounds {
     }
 
     fn include_resistor_terminal_ticks(&mut self, elements: &[Element]) {
-        let all_endpoints: Vec<_> = elements
-            .iter()
-            .flat_map(|element| {
-                let (start, end) = element.endpoints();
-                [start, end]
-            })
-            .collect();
+        let terminals = unconnected_resistor_terminal_positions(elements);
 
         for element in elements {
             let Element::Resistor(start, end) = *element else {
@@ -280,11 +270,7 @@ impl Bounds {
             let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
             let half_length = resistor_half_width(length);
             for position in [start, end] {
-                let connections = all_endpoints
-                    .iter()
-                    .filter(|other| **other == position)
-                    .count();
-                if connections == 1 {
+                if terminals.contains(&position) {
                     self.include(position - perpendicular * half_length);
                     self.include(position + perpendicular * half_length);
                 }
@@ -396,13 +382,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 
 fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
-    let all_endpoints: Vec<_> = elements
-        .iter()
-        .flat_map(|element| {
-            let (start, end) = element.endpoints();
-            [start, end]
-        })
-        .collect();
+    let terminals = unconnected_resistor_terminal_positions(elements);
 
     for element in elements {
         let Element::Resistor(start, end) = *element else {
@@ -417,11 +397,7 @@ fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
         let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
         let half_length = resistor_half_width(length);
         for position in [start, end] {
-            let connection_count = all_endpoints
-                .iter()
-                .filter(|other| **other == position)
-                .count();
-            if connection_count == 1 {
+            if terminals.contains(&position) {
                 line(
                     output,
                     position - perpendicular * half_length,
@@ -558,7 +534,6 @@ mod tests {
     #[test]
     fn exports_every_element_type() {
         let elements = [
-            Element::Line(egui::pos2(1.0, 2.0), egui::pos2(3.0, 4.0)),
             Element::Resistor(egui::pos2(10.0, 10.0), egui::pos2(110.0, 10.0)),
             Element::PrescribedFlow(egui::pos2(20.0, 20.0), egui::pos2(120.0, 20.0)),
         ];
@@ -567,14 +542,14 @@ mod tests {
         let document = svg(
             &ctx,
             &elements,
-            &[String::new(), String::new(), String::new()],
+            &[String::new(), String::new()],
             &[],
             &[],
             label::LabelStyle::default(),
         );
 
         assert!(document.starts_with("<svg"));
-        assert!(document.contains("width=\"123\""));
+        assert!(document.contains("width=\"114\""));
         assert!(document.contains("height=\"38\""));
         assert!(document.contains("<path"));
         assert!(document.contains("<circle"));
@@ -583,7 +558,10 @@ mod tests {
 
     #[test]
     fn exports_escaped_labels() {
-        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
+        let elements = [Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
         let ctx = test_context();
         let document = svg(
             &ctx,
@@ -600,7 +578,10 @@ mod tests {
 
     #[test]
     fn exports_selected_label_typography() {
-        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
+        let elements = [Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
         let ctx = test_context();
         for font in label::LabelFont::ALL {
             let document = svg(
@@ -622,12 +603,12 @@ mod tests {
     #[test]
     fn clipboard_image_is_cropped_and_opaque() {
         let ctx = test_context();
-        let elements = [Element::Line(
+        let elements = [Element::Resistor(
             egui::pos2(500.0, 600.0),
             egui::pos2(600.0, 600.0),
         )];
         let image = image(&ctx, &elements, &[], &[], &[], label::LabelStyle::default()).unwrap();
-        assert_eq!((image.width(), image.height()), (204, 4));
+        assert_eq!((image.width(), image.height()), (204, 44));
         assert!(image.data().chunks_exact(4).all(|pixel| pixel[3] == 255));
         assert!(image.data().chunks_exact(4).any(|pixel| pixel[0] < 128));
     }
@@ -676,7 +657,7 @@ mod tests {
     #[test]
     fn clipboard_image_rejects_excessive_dimensions() {
         let ctx = test_context();
-        let elements = [Element::Line(
+        let elements = [Element::Resistor(
             egui::Pos2::ZERO,
             egui::pos2(100_000.0, 100_000.0),
         )];
@@ -692,7 +673,10 @@ mod tests {
 
     #[test]
     fn exports_subscripts_and_superscripts() {
-        let elements = [Element::Line(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0))];
+        let elements = [Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
         let ctx = test_context();
         let document = svg(
             &ctx,

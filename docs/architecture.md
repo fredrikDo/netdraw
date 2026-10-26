@@ -86,9 +86,8 @@ cropping or misplaced scripts.
 
 ### 1. Build topology
 
-`drawing_topology` gathers connectable endpoints and merges the endpoints of ideal
-lines. A node identifier is a representative endpoint index; identifiers can have
-gaps after merging. `connected_component` traverses conductance edges from the
+`drawing_topology` gathers connectable endpoints; each distinct position is one
+node, identified by its index. `connected_component` traverses conductance edges from the
 selection. Only that component is validated and solved.
 
 Only a prescribed-flow arrow's tip enters topology. The arrow is an external
@@ -97,9 +96,10 @@ not define the solver graph.
 
 ### 2. Identify boundaries and validate
 
-`boundary_pressure` reads terminal labels as known values. An unlabeled degree-one
-node without prescribed inflow is considered a missing boundary label; a node with
-prescribed inflow can instead be an unknown node. Connected terminal labels with
+`boundary_pressure` reads non-empty terminal labels as known values. A node at one
+of `element::unconnected_resistor_terminal_positions` without a label is a missing
+boundary label. The renderer and exporter draw terminal ticks from the same function,
+so the solver's free terminals are exactly the ticked endpoints. Connected terminal labels with
 different values are rejected. Internal node labels only name results.
 
 `solve_selected` validates the selection, component labels, boundary presence, and
@@ -123,8 +123,9 @@ share the same assembly logic.
 ### 4. Separate a shared reference
 
 If a boundary label appears on multiple mathematical nodes, `reference_solution`
-chooses a most frequent shared label. It solves a unit response for each other
-boundary label and for each distinct prescribed-flux label. The final expression
+chooses a most frequent shared label. It builds a unit response for each other
+boundary label and for each distinct prescribed-flux label. The matrix is the same
+for all of them, so all right-hand sides are solved in one elimination. The final expression
 is the reference plus weighted boundary differences and independent fluxes.
 Repeated flux labels are combined into one source response. Fluxes on known
 boundaries do not affect unknown values.
@@ -141,6 +142,7 @@ denominator of such polynomials.
 
 Arithmetic combines terms exactly, cancels numeric content and common monomials,
 and attempts cancellation of polynomial factors encountered in earlier operations.
+When the denominator is constant no polynomial cancellation is attempted.
 Exact multivariate long division verifies cancellation; a remainder or work-limit
 failure leaves the original factor uncancelled. Candidate tracking is bounded and
 is not a general polynomial GCD or factorization algorithm.
@@ -150,23 +152,29 @@ Current work limits in `symbolic.rs`:
 | Limit | Value / meaning |
 | --- | --- |
 | Polynomial terms | 2,048 retained terms |
-| Multiplication precheck | At most 8,192 input term pairs |
+| Multiplication precheck | At most 2^20 input term pairs |
+| Elimination cross products | At most 16,384 terms before the exact division |
 | Exact-division loop | At most 2,048 iterations per attempt |
 | Tracked factor candidates | At most 64 per expression |
 
-`solve` uses Gaussian elimination with row swapping for structurally zero pivots,
-then back substitution. It forms no matrix inverse. Symbolic parameters are
+`solve_target` uses fraction-free (Bareiss) elimination on the augmented matrix
+`[A without target column | A target column | b_1 ... b_m]`, with row swapping for
+structurally zero pivots. Each step divides exactly by the previous pivot, so every
+intermediate entry is a minor of the input. The last row then holds `det(A)` and
+the Cramer numerator of the target for every right-hand side. The leading minors
+(pivots) and multi-term matrix entries are the cancellation candidates for the
+final ratio. It forms no matrix inverse and needs no back substitution. Symbolic parameters are
 handled generically: positivity/finiteness is assumed by the model, and the code
 does not enumerate special parameter values or track all excluded denominators.
 A structurally singular system is reported as lacking a unique solution.
 
 ### 6. Choose readable output
 
-`compact_solution` first obtains the cancelled exact solution. For polynomial
-systems it also constructs a factored ratio of determinants using Cramer's rule
+`compact_solutions` first obtains the cancelled exact solutions. It also constructs a factored ratio of determinants using Cramer's rule
 for presentation. Sparse Laplace expansion chooses a row with few nonzero entries.
 The formatter keeps sums/products, groups repeated factors into powers, and adds
 parentheses according to precedence. It chooses the shorter rendered candidate.
+The denominator determinant is built once and shared by all right-hand sides.
 
 `Formula` is a presentation tree, not an alternative algebra engine. It does not
 change the canonical arithmetic representation. Numerical regression tests compare

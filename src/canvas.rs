@@ -36,7 +36,6 @@ enum ToolIcon {
     Camera,
     Grid,
     SnapToGrid,
-    Line,
     Resistor,
     PrescribedFlow,
     Select,
@@ -61,6 +60,13 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_ui_native("NetDraw", options, move |ui, _frame| {
         canvas.show(ui);
     })
+}
+
+/// A solve runs on a worker thread so large networks never block the UI.
+/// Dropping the receiver (closing the dialog or solving again) discards a stale result.
+enum SolveState {
+    Running(std::sync::mpsc::Receiver<Result<String, String>>),
+    Done(Result<String, String>),
 }
 
 /// UI owner. `drawing()` extracts the persistent subset for pure downstream operations.
@@ -95,7 +101,7 @@ struct Canvas {
     history_drawing: Drawing,
     undo_stack: Vec<Drawing>,
     redo_stack: Vec<Drawing>,
-    solve_result: Option<Result<String, String>>,
+    solve: Option<SolveState>,
     file_status: Option<String>,
     pending_file_action: Option<FileAction>,
     allow_close: bool,
@@ -146,7 +152,7 @@ impl Default for Canvas {
             history_drawing: Drawing::empty(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            solve_result: None,
+            solve: None,
             file_status: None,
             pending_file_action: None,
             allow_close: false,
@@ -858,11 +864,29 @@ impl Canvas {
 
     /// Display the last explicitly requested solve; edits do not silently recompute it.
     fn show_solve_dialog(&mut self, ctx: &egui::Context) {
-        let Some(result) = &self.solve_result else {
+        if let Some(SolveState::Running(receiver)) = &self.solve {
+            match receiver.try_recv() {
+                Ok(result) => self.solve = Some(SolveState::Done(result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.solve = Some(SolveState::Done(Err(
+                        "The solver stopped unexpectedly.".into()
+                    )));
+                }
+            }
+        }
+        let Some(state) = &self.solve else {
             return;
         };
         let mut open = true;
         egui::Window::new("Node expression").open(&mut open).default_width(560.0).show(ctx, |ui| {
+            let SolveState::Done(result) = state else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Solving…");
+                });
+                return;
+            };
             match result {
                 Ok(expression) => {
                     ui.label("Expression for the network as it was when Solve was clicked:");
@@ -875,8 +899,24 @@ impl Canvas {
             }
         });
         if !open {
-            self.solve_result = None;
+            self.solve = None;
         }
+    }
+
+    /// Solve a snapshot of the drawing in the background; later edits do not affect it.
+    fn start_solve(&mut self, ctx: &egui::Context) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let drawing = self.drawing();
+        let selection = self.selected_endpoints.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::network_solver::solve_selected(&drawing, &selection);
+            // The receiver is gone if the dialog was closed or a newer solve started.
+            if sender.send(result).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.solve = Some(SolveState::Running(receiver));
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -899,7 +939,6 @@ impl Canvas {
                 }
             });
             ui.separator();
-            self.select_mode(ui, DrawMode::Line, ToolIcon::Line, "Line");
             self.select_mode(ui, DrawMode::Resistor, ToolIcon::Resistor, "Conductance");
             self.select_mode(
                 ui,
@@ -932,10 +971,7 @@ impl Canvas {
                 }
             });
             if Self::tool_button(ui, false, ToolIcon::Solve, "Solve selected node").clicked() {
-                self.solve_result = Some(crate::network_solver::solve_selected(
-                    &self.drawing(),
-                    &self.selected_endpoints,
-                ));
+                self.start_solve(ui.ctx());
             }
             self.select_mode(ui, DrawMode::Label, ToolIcon::Label, "Add label");
             ui.separator();
@@ -1126,9 +1162,6 @@ impl Canvas {
                     [center - egui::vec2(6.0, 0.0), center + egui::vec2(6.0, 0.0)],
                     stroke,
                 );
-            }
-            ToolIcon::Line => {
-                painter.line_segment([left, right], stroke);
             }
             ToolIcon::Resistor => {
                 let lead = rect.width() * 0.18;
@@ -1629,7 +1662,7 @@ impl Canvas {
         if response.is_pointer_button_down_on() && self.start.is_none() {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
-                    DrawMode::Line | DrawMode::Resistor => {
+                    DrawMode::Resistor => {
                         self.start = Some(self.snap_position(position, &[]));
                     }
                     // The arrow tail only snaps when the grid is enabled.
@@ -1670,8 +1703,7 @@ impl Canvas {
                             self.drag_origin = Some(position);
                         }
                     }
-                    DrawMode::Line
-                    | DrawMode::Resistor
+                    DrawMode::Resistor
                     | DrawMode::PrescribedFlow
                     | DrawMode::Label
                     | DrawMode::Erase => {}
@@ -1727,9 +1759,6 @@ impl Canvas {
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = self.snap_position(position, &[]);
             match self.draw_mode {
-                DrawMode::Line => {
-                    draw_element(painter, Element::Line(start, end).translated(origin))
-                }
                 DrawMode::Resistor => {
                     draw_element(painter, Element::Resistor(start, end).translated(origin))
                 }
@@ -1762,14 +1791,13 @@ impl Canvas {
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = self.snap_position(position, &[]);
             match self.draw_mode {
-                DrawMode::Line => self.elements.push(Element::Line(start, end)),
                 DrawMode::Resistor => self.elements.push(Element::Resistor(start, end)),
                 DrawMode::PrescribedFlow => self.elements.push(Element::PrescribedFlow(start, end)),
                 DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
             }
             if matches!(
                 self.draw_mode,
-                DrawMode::Line | DrawMode::Resistor | DrawMode::PrescribedFlow
+                DrawMode::Resistor | DrawMode::PrescribedFlow
             ) {
                 self.labels.push(String::new());
             }
@@ -1901,7 +1929,7 @@ mod tests {
     #[test]
     fn grid_snaps_to_intersections_and_restores_endpoint_snapping_when_disabled() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Line(
+        canvas.elements.push(Element::Resistor(
             egui::pos2(13.0, 17.0),
             egui::pos2(103.0, 107.0),
         ));
@@ -1953,7 +1981,7 @@ mod tests {
     #[test]
     fn grid_toggle_does_not_change_document_or_svg() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Line(
+        canvas.elements.push(Element::Resistor(
             egui::pos2(20.0, 20.0),
             egui::pos2(100.0, 80.0),
         ));
@@ -1980,9 +2008,10 @@ mod tests {
     fn undo_redo_restores_drawing_and_saved_state() {
         let mut canvas = Canvas::default();
         let empty = canvas.drawing();
-        canvas
-            .elements
-            .push(Element::Line(egui::pos2(0.0, 0.0), egui::pos2(50.0, 0.0)));
+        canvas.elements.push(Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(50.0, 0.0),
+        ));
         canvas.labels.push("R_1".into());
         canvas.label_style.font = crate::label::LabelFont::SourceSerif4;
         let edited = canvas.drawing();
@@ -2083,7 +2112,7 @@ mod tests {
         canvas.elements = vec![
             Element::Resistor(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0)),
             Element::Resistor(egui::pos2(100.0, 0.0), egui::pos2(100.0, 200.0)),
-            Element::Line(egui::pos2(100.0, 0.0), egui::pos2(300.0, 300.0)),
+            Element::Resistor(egui::pos2(100.0, 0.0), egui::pos2(300.0, 300.0)),
         ];
         canvas.labels = vec![String::new(); 3];
         canvas.selected_endpoints = vec![
@@ -2134,7 +2163,7 @@ mod tests {
         canvas.elements = vec![
             Element::Resistor(egui::pos2(13.0, 23.0), egui::pos2(103.0, 23.0)),
             Element::Resistor(egui::pos2(103.0, 23.0), egui::pos2(103.0, 213.0)),
-            Element::Line(egui::pos2(103.0, 23.0), egui::pos2(303.0, 313.0)),
+            Element::Resistor(egui::pos2(103.0, 23.0), egui::pos2(303.0, 313.0)),
         ];
         canvas.labels = vec![String::new(); 3];
         canvas.selected_endpoints = vec![
@@ -2266,9 +2295,42 @@ mod tests {
     }
 
     #[test]
+    fn solve_runs_in_background_on_a_snapshot() {
+        let mut canvas = Canvas::default();
+        canvas.elements.push(Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        ));
+        canvas.labels.push("G".into());
+        canvas.elements.push(Element::PrescribedFlow(
+            egui::pos2(100.0, 50.0),
+            egui::pos2(100.0, 0.0),
+        ));
+        canvas.labels.push("Q".into());
+        canvas.terminal_labels.push(crate::label::NodeLabel {
+            position: egui::pos2(0.0, 0.0),
+            text: "T_0".into(),
+        });
+        canvas.selected_endpoints.push(DraggedEndpoint {
+            element_index: 0,
+            is_start: false,
+        });
+        canvas.start_solve(&egui::Context::default());
+        // Edits after clicking Solve must not change the pending result.
+        canvas.labels[0] = "K".into();
+        let Some(SolveState::Running(receiver)) = &canvas.solve else {
+            panic!("solve did not start in the background");
+        };
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.unwrap(), "p_selected = (G*T_0 + Q) / (G)");
+    }
+
+    #[test]
     fn alignment_requires_at_least_two_endpoints() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Line(
+        canvas.elements.push(Element::Resistor(
             egui::pos2(10.0, 20.0),
             egui::pos2(50.0, 80.0),
         ));

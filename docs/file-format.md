@@ -10,14 +10,15 @@ backups when moving between builds.
 | Field | Meaning |
 | --- | --- |
 | `version` | Integer format version, currently `1` |
-| `elements` | Ordered array of line, zigzag, and prescribed-flow geometry |
+| `elements` | Ordered array of zigzag and prescribed-flow geometry |
 | `labels` | String array with exactly one entry per element, in the same order |
 | `node_labels` | Position-attached labels that name internal nodes |
 | `terminal_labels` | Position-attached labels used as known boundary values |
 | `label_style` | Shared font and size for drawing labels |
 
 Each element has `type`, `start`, and `end`. A position is `[x, y]` in canvas
-coordinates. Valid types are `line`, `resistor`, and `prescribed_flow`.
+coordinates. Valid types are `resistor` and `prescribed_flow`. Files containing the
+former `line` (plain wire) type are rejected with an explanatory error.
 `resistor` stores the zigzag geometry; the solver interprets its label as
 conductance. Only a `prescribed_flow` element's `end` is mathematically connected.
 

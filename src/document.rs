@@ -63,9 +63,17 @@ struct SavedDrawing {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SavedElement {
-    Line { start: [f32; 2], end: [f32; 2] },
-    Resistor { start: [f32; 2], end: [f32; 2] },
-    PrescribedFlow { start: [f32; 2], end: [f32; 2] },
+    /// Plain wires are no longer supported; kept only to reject old files clearly.
+    #[serde(skip_serializing)]
+    Line {},
+    Resistor {
+        start: [f32; 2],
+        end: [f32; 2],
+    },
+    PrescribedFlow {
+        start: [f32; 2],
+        end: [f32; 2],
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,7 +135,11 @@ impl TryFrom<SavedDrawing> for Drawing {
         }
 
         let drawing = Self {
-            elements: saved.elements.into_iter().map(Into::into).collect(),
+            elements: saved
+                .elements
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             labels: saved.labels,
             node_labels: saved.node_labels.into_iter().map(Into::into).collect(),
             terminal_labels: saved.terminal_labels.into_iter().map(Into::into).collect(),
@@ -168,10 +180,6 @@ impl From<Element> for SavedElement {
     fn from(element: Element) -> Self {
         let point = |position: egui::Pos2| [position.x, position.y];
         match element {
-            Element::Line(start, end) => Self::Line {
-                start: point(start),
-                end: point(end),
-            },
             Element::Resistor(start, end) => Self::Resistor {
                 start: point(start),
                 end: point(end),
@@ -184,14 +192,19 @@ impl From<Element> for SavedElement {
     }
 }
 
-impl From<SavedElement> for Element {
-    fn from(element: SavedElement) -> Self {
+impl TryFrom<SavedElement> for Element {
+    type Error = String;
+
+    fn try_from(element: SavedElement) -> Result<Self, Self::Error> {
         let point = |position: [f32; 2]| egui::pos2(position[0], position[1]);
         match element {
-            SavedElement::Line { start, end } => Self::Line(point(start), point(end)),
-            SavedElement::Resistor { start, end } => Self::Resistor(point(start), point(end)),
+            SavedElement::Line {} => Err(String::from(
+                "This NetDraw file contains plain wires, which are no longer supported. \
+                 Redraw them as conductances or join the endpoints directly.",
+            )),
+            SavedElement::Resistor { start, end } => Ok(Self::Resistor(point(start), point(end))),
             SavedElement::PrescribedFlow { start, end } => {
-                Self::PrescribedFlow(point(start), point(end))
+                Ok(Self::PrescribedFlow(point(start), point(end)))
             }
         }
     }
@@ -263,11 +276,10 @@ mod tests {
     fn drawing_round_trips_through_json() {
         let drawing = Drawing {
             elements: vec![
-                Element::Line(egui::pos2(1.0, 2.0), egui::pos2(3.0, 4.0)),
                 Element::Resistor(egui::pos2(3.0, 4.0), egui::pos2(8.0, 9.0)),
                 Element::PrescribedFlow(egui::pos2(7.0, 6.0), egui::pos2(3.0, 4.0)),
             ],
-            labels: vec!["wire".into(), "R_1".into(), "q".into()],
+            labels: vec!["R_1".into(), "q".into()],
             node_labels: vec![NodeLabel {
                 position: egui::pos2(3.0, 4.0),
                 text: "A".into(),
@@ -315,7 +327,17 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_element_labels() {
-        let json = r#"{"version":1,"elements":[{"type":"line","start":[0,0],"end":[1,1]}],"labels":[],"node_labels":[],"terminal_labels":[],"label_style":{"font":"inter","size":18}}"#;
+        let json = r#"{"version":1,"elements":[{"type":"resistor","start":[0,0],"end":[1,1]}],"labels":[],"node_labels":[],"terminal_labels":[],"label_style":{"font":"inter","size":18}}"#;
         assert!(Drawing::from_json(json).is_err());
+    }
+
+    #[test]
+    fn rejects_files_with_plain_wires() {
+        let json = r#"{"version":1,"elements":[{"type":"line","start":[0,0],"end":[1,1]}],"labels":[""],"node_labels":[],"terminal_labels":[],"label_style":{"font":"inter","size":18}}"#;
+        assert!(
+            Drawing::from_json(json)
+                .unwrap_err()
+                .contains("plain wires")
+        );
     }
 }

@@ -3,6 +3,7 @@ use crate::symbolic_format::{Formula, determinant};
 use num_bigint::BigInt;
 use num_traits::{One, Signed, Zero};
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 // Sorted symbols encode a monomial: [a, a, b] means a^2*b; [] means 1.
 type Monomial = Vec<String>;
@@ -11,6 +12,8 @@ type Monomial = Vec<String>;
 struct Polynomial(BTreeMap<Monomial, BigInt>);
 // Bound intermediate growth as well as final output; a node cap alone is insufficient.
 const MAX_TERMS: usize = 2048;
+// Bounds the work of one multiplication; results are still capped at MAX_TERMS.
+const MAX_PRODUCT_PAIRS: usize = 1 << 20;
 type AlgebraResult<T> = Result<T, String>;
 impl Polynomial {
     fn constant(n: i32) -> Self {
@@ -24,12 +27,15 @@ impl Polynomial {
         Self(BTreeMap::from([(vec![name.into()], BigInt::one())]))
     }
     fn add(&self, other: &Self) -> AlgebraResult<Self> {
+        self.add_bounded(other, MAX_TERMS)
+    }
+    fn add_bounded(&self, other: &Self, max_terms: usize) -> AlgebraResult<Self> {
         let mut terms = self.0.clone();
         for (m, c) in &other.0 {
             *terms.entry(m.clone()).or_default() += c;
         }
         terms.retain(|_, c| !c.is_zero());
-        if terms.len() > MAX_TERMS {
+        if terms.len() > max_terms {
             return Err("Expression is too large; reduce the network first.".into());
         }
         Ok(Self(terms))
@@ -38,7 +44,10 @@ impl Polynomial {
         Self(self.0.iter().map(|(m, c)| (m.clone(), -c)).collect())
     }
     fn mul(&self, other: &Self) -> AlgebraResult<Self> {
-        if self.0.len().saturating_mul(other.0.len()) > MAX_TERMS * 4 {
+        self.mul_bounded(other, MAX_TERMS)
+    }
+    fn mul_bounded(&self, other: &Self, max_terms: usize) -> AlgebraResult<Self> {
+        if self.0.len().saturating_mul(other.0.len()) > MAX_PRODUCT_PAIRS {
             return Err("Expression is too large; reduce the network first.".into());
         }
         let mut terms = BTreeMap::<Monomial, BigInt>::new();
@@ -51,39 +60,73 @@ impl Polynomial {
             }
         }
         terms.retain(|_, c| !c.is_zero());
-        if terms.len() > MAX_TERMS {
+        if terms.len() > max_terms {
             return Err("Expression is too large; reduce the network first.".into());
         }
         Ok(Self(terms))
+    }
+    fn is_constant(&self) -> bool {
+        self.0.keys().all(Vec::is_empty)
     }
     /// Exact multivariate long division over integer coefficients.
     /// A failed or oversized division simply leaves the original expression intact.
     fn exact_quotient(&self, divisor: &Self) -> Option<Self> {
         let (leading_monomial, leading_coefficient) = divisor.leading_term()?;
-        let mut remainder = self.clone();
-        let mut quotient = Self::constant(0);
+        if divisor.is_constant() {
+            return self
+                .0
+                .iter()
+                .map(|(m, c)| {
+                    (c % leading_coefficient)
+                        .is_zero()
+                        .then(|| (m.clone(), c / leading_coefficient))
+                })
+                .collect::<Option<_>>()
+                .map(Self);
+        }
+        // Key the remainder by (degree, monomial), the graded order used by
+        // `leading_term`, so the leading term is always the last entry, and subtract
+        // in place: rescanning or rebuilding the remainder each step is quadratic.
+        let mut remainder: BTreeMap<(usize, Monomial), BigInt> = self
+            .0
+            .iter()
+            .map(|(m, c)| ((m.len(), m.clone()), c.clone()))
+            .collect();
+        let mut quotient = BTreeMap::new();
         for _ in 0..MAX_TERMS {
-            let Some((monomial, coefficient)) = remainder.leading_term() else {
-                return Some(quotient);
+            let Some(((_, monomial), coefficient)) = remainder.last_key_value() else {
+                return Some(Self(quotient));
             };
             let factor = divide_monomial(monomial, leading_monomial)?;
             if !(coefficient % leading_coefficient).is_zero() {
                 return None;
             }
-            let term = Self(BTreeMap::from([(
-                factor,
-                coefficient / leading_coefficient,
-            )]));
-            quotient = quotient.add(&term).ok()?;
-            remainder = remainder.add(&divisor.mul(&term).ok()?.neg()).ok()?;
+            let scale = coefficient / leading_coefficient;
+            for (m, c) in &divisor.0 {
+                let mut product = m.clone();
+                product.extend(factor.iter().cloned());
+                product.sort();
+                match remainder.entry((product.len(), product)) {
+                    Entry::Occupied(mut entry) => {
+                        *entry.get_mut() -= c * &scale;
+                        if entry.get().is_zero() {
+                            entry.remove();
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(-(c * &scale));
+                    }
+                }
+            }
+            quotient.insert(factor, scale);
+            if remainder.len() > MAX_TERMS * 4 {
+                return None;
+            }
         }
         None
     }
-    /// Use a graded monomial order so each long-division step reduces the remainder.
     fn leading_term(&self) -> Option<(&Monomial, &BigInt)> {
-        self.0
-            .iter()
-            .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        leading_term(&self.0)
     }
     /// Normalize coefficient content/sign for comparison of cancellation candidates.
     fn primitive_part(&self) -> Self {
@@ -137,6 +180,13 @@ impl Polynomial {
         result
     }
 }
+/// Use a graded monomial order so each long-division step reduces the remainder.
+fn leading_term(terms: &BTreeMap<Monomial, BigInt>) -> Option<(&Monomial, &BigInt)> {
+    terms
+        .iter()
+        .max_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+}
+
 /// Subtract symbol multiplicities, failing if the divisor is not a monomial factor.
 fn divide_monomial(dividend: &Monomial, divisor: &Monomial) -> Option<Monomial> {
     let mut remaining = dividend.clone();
@@ -185,10 +235,12 @@ fn cancel_polynomial_factors(
     factors: &[Polynomial],
 ) -> (Polynomial, Polynomial) {
     for factor in factors {
-        while let (Some(n), Some(d)) = (
-            numerator.exact_quotient(factor),
-            denominator.exact_quotient(factor),
-        ) {
+        // A constant denominator has no polynomial factor; try it first because the
+        // denominator is usually the smaller side and a failure there skips the numerator.
+        while !denominator.is_constant()
+            && let Some(d) = denominator.exact_quotient(factor)
+            && let Some(n) = numerator.exact_quotient(factor)
+        {
             numerator = n;
             denominator = d;
         }
@@ -221,10 +273,6 @@ impl Expression {
             denominator: Polynomial::constant(1),
             factors: Vec::new(),
         }
-    }
-    /// Test structural zero after exact term collection.
-    pub fn is_zero(&self) -> bool {
-        self.numerator.0.is_empty()
     }
     /// Cancel verified factors, common monomials/content, and normalize denominator sign.
     fn normalized(
@@ -321,17 +369,6 @@ impl Expression {
             cancellation_factors(&[self, other]),
         ))
     }
-    /// Divide by a structurally nonzero expression; special parameter zeros are not tracked.
-    pub fn div(&self, other: &Self) -> AlgebraResult<Self> {
-        if other.is_zero() {
-            return Err("Network has no unique solution. Check pressure boundaries.".into());
-        }
-        Ok(Self::normalized(
-            self.numerator.mul(&other.denominator)?,
-            self.denominator.mul(&other.numerator)?,
-            cancellation_factors(&[self, other]),
-        ))
-    }
     /// Render expanded polynomial notation, useful for stable symbol names and diagnostics.
     pub fn text(&self) -> String {
         if self.denominator == Polynomial::constant(1) {
@@ -345,94 +382,158 @@ impl Expression {
         }
     }
 }
-/// Choose between the cancelled exact result and a factored determinant ratio.
-/// Cramer's rule is used for presentation only, on small polynomial systems.
-pub fn compact_solution(
+/// Solve `A*x = b` for one unknown and several right-hand sides, choosing per result
+/// between the cancelled exact value and a factored determinant ratio.
+pub fn compact_solutions(
     matrix: Vec<Vec<Expression>>,
-    rhs: Vec<Expression>,
+    rhs: Vec<Vec<Expression>>,
     target: usize,
-) -> AlgebraResult<String> {
-    Ok(compact_formula(matrix, rhs, target)?.text())
+) -> AlgebraResult<Vec<String>> {
+    Ok(compact_formulas(matrix, rhs, target)?
+        .iter()
+        .map(Formula::text)
+        .collect())
 }
 
-/// Validate through exact solving before selecting an equivalent shorter display tree.
-fn compact_formula(
+/// Shares one elimination and one denominator determinant across all right-hand sides.
+fn compact_formulas(
     matrix: Vec<Vec<Expression>>,
-    rhs: Vec<Expression>,
+    rhs: Vec<Vec<Expression>>,
     target: usize,
-) -> AlgebraResult<Formula> {
-    if target >= rhs.len() {
-        return Err("Invalid target node index.".into());
-    }
-    let values = solve(matrix.clone(), rhs.clone())?;
-    let value = &values[target];
-    let compact = Formula::ratio(value.numerator.formula(), value.denominator.formula());
-    if matrix
-        .iter()
-        .flatten()
-        .chain(&rhs)
-        .any(|e| e.denominator != Polynomial::constant(1))
-    {
-        return Ok(compact);
-    }
+) -> AlgebraResult<Vec<Formula>> {
+    let values = solve_target(&matrix, &rhs, target)?;
     let denominator: Vec<Vec<_>> = matrix
         .iter()
         .map(|row| row.iter().map(|e| e.numerator.formula()).collect())
         .collect();
-    let mut numerator = denominator.clone();
-    for (row, b) in numerator.iter_mut().zip(&rhs) {
-        row[target] = b.numerator.formula();
-    }
-    let factored = Formula::ratio(determinant(&numerator), determinant(&denominator));
-    Ok(if factored.text().len() < compact.text().len() {
-        factored
-    } else {
-        compact
-    })
+    let denominator_determinant = determinant(&denominator);
+    Ok(values
+        .iter()
+        .zip(&rhs)
+        .map(|(value, b)| {
+            let compact = Formula::ratio(value.numerator.formula(), value.denominator.formula());
+            let mut numerator = denominator.clone();
+            for (row, b) in numerator.iter_mut().zip(b) {
+                row[target] = b.numerator.formula();
+            }
+            let factored = Formula::ratio(determinant(&numerator), denominator_determinant.clone());
+            if factored.text().len() < compact.text().len() {
+                factored
+            } else {
+                compact
+            }
+        })
+        .collect())
 }
 
-/// Gaussian elimination with exact symbolic coefficients; no matrix inverse is formed.
-pub fn solve(
-    mut a: Vec<Vec<Expression>>,
-    mut b: Vec<Expression>,
+/// Fraction-free (Bareiss) elimination on `[A without target | A target | b_1 ... b_m]`.
+/// Every intermediate entry is a minor of the input, so expressions stay as small as
+/// the determinants themselves and every division is exact. The last row then holds
+/// `det(A)` and, for each `b_r`, the Cramer numerator for the target unknown.
+/// Entries must be polynomials (denominator 1), as nodal equations always are.
+fn solve_target(
+    matrix: &[Vec<Expression>],
+    rhs: &[Vec<Expression>],
+    target: usize,
 ) -> AlgebraResult<Vec<Expression>> {
-    let n = b.len();
-    if a.len() != n || a.iter().any(|r| r.len() != n) {
+    let n = matrix.len();
+    if matrix.iter().any(|row| row.len() != n) || rhs.iter().any(|b| b.len() != n) {
         return Err("Invalid equation dimensions.".into());
     }
+    if target >= n {
+        return Err("Invalid target node index.".into());
+    }
+    let polynomial = |e: &Expression| {
+        if e.denominator == Polynomial::constant(1) {
+            Ok(e.numerator.clone())
+        } else {
+            Err(String::from("Equations must have polynomial coefficients."))
+        }
+    };
+    let mut rows = (0..n)
+        .map(|i| {
+            let columns = (0..n).filter(|&j| j != target).chain([target]);
+            columns
+                .map(|j| polynomial(&matrix[i][j]))
+                .chain(rhs.iter().map(|b| polynomial(&b[i])))
+                .collect::<AlgebraResult<Vec<_>>>()
+        })
+        .collect::<AlgebraResult<Vec<_>>>()?;
+    let mut candidates = Vec::new();
+    for entry in rows.iter().flat_map(|row| &row[..n]) {
+        let factor = entry.primitive_part();
+        if factor.0.len() > 1 && !candidates.contains(&factor) {
+            candidates.push(factor);
+        }
+    }
+    let too_large = || String::from("Expression is too large; reduce the network first.");
+    let mut previous_pivot = Polynomial::constant(1);
     for k in 0..n {
         let pivot = (k..n)
-            .find(|&i| !a[i][k].is_zero())
+            .find(|&i| !rows[i][k].0.is_empty())
             .ok_or("Network has no unique solution. Add a known pressure boundary.")?;
-        a.swap(k, pivot);
-        b.swap(k, pivot);
-        for i in k + 1..n {
-            if a[i][k].is_zero() {
-                continue;
+        rows.swap(k, pivot);
+        let (upper, lower) = rows.split_at_mut(k + 1);
+        let pivot_row = &upper[k];
+        for row in lower {
+            for j in k + 1..row.len() {
+                // The cross product may exceed the cap briefly; the exact division
+                // brings it back to the size of a minor, which must fit.
+                let limit = MAX_TERMS * 8;
+                let cross = pivot_row[k]
+                    .mul_bounded(&row[j], limit)?
+                    .add_bounded(&row[k].mul_bounded(&pivot_row[j], limit)?.neg(), limit)?;
+                row[j] = if k == 0 {
+                    cross
+                } else {
+                    cross
+                        .exact_quotient(&previous_pivot)
+                        .ok_or_else(too_large)?
+                };
+                if row[j].0.len() > MAX_TERMS {
+                    return Err(too_large());
+                }
             }
-            // Eliminate below the pivot without forming an inverse or using floating point.
-            let factor = a[i][k].div(&a[k][k])?;
-            for j in k + 1..n {
-                a[i][j] = a[i][j].sub(&factor.mul(&a[k][j])?)?;
-            }
-            b[i] = b[i].sub(&factor.mul(&b[k])?)?;
-            a[i][k] = Expression::integer(0);
+            row[k] = Polynomial::constant(0);
+        }
+        previous_pivot = rows[k][k].clone();
+        // Leading minors are the usual source of factors shared by numerator and denominator.
+        let factor = previous_pivot.primitive_part();
+        if factor.0.len() > 1 && !candidates.contains(&factor) {
+            candidates.push(factor);
         }
     }
-    // Recover unknowns from the resulting upper-triangular system.
-    let mut x = vec![Expression::integer(0); n];
-    for i in (0..n).rev() {
-        let mut rhs = b[i].clone();
-        for j in i + 1..n {
-            rhs = rhs.sub(&a[i][j].mul(&x[j])?)?;
-        }
-        x[i] = rhs.div(&a[i][i])?;
-    }
-    Ok(x)
+    let last = rows.pop().unwrap_or_default();
+    let (determinant, numerators) = (&last[n - 1], &last[n..]);
+    Ok(numerators
+        .iter()
+        .map(|numerator| {
+            Expression::normalized(numerator.clone(), determinant.clone(), candidates.clone())
+        })
+        .collect())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Every unknown, via one fraction-free elimination per target.
+    fn solve(a: Vec<Vec<Expression>>, b: Vec<Expression>) -> AlgebraResult<Vec<Expression>> {
+        (0..b.len())
+            .map(|target| Ok(solve_target(&a, &[b.clone()], target)?.remove(0)))
+            .collect()
+    }
+    impl Expression {
+        fn is_zero(&self) -> bool {
+            self.numerator.0.is_empty()
+        }
+        fn div(&self, other: &Self) -> AlgebraResult<Self> {
+            assert!(!other.is_zero());
+            Ok(Self::normalized(
+                self.numerator.mul(&other.denominator)?,
+                self.denominator.mul(&other.numerator)?,
+                cancellation_factors(&[self, other]),
+            ))
+        }
+    }
     fn evaluate(expression: &Expression, symbols: &[(&str, f64)]) -> f64 {
         use num_traits::ToPrimitive;
         let polynomial = |p: &Polynomial| {
@@ -550,7 +651,7 @@ mod tests {
         ];
         let rhs = vec![zero.clone(), zero, kh];
         let exact = solve(matrix.clone(), rhs.clone()).unwrap();
-        let formula = compact_formula(matrix, rhs, 0).unwrap();
+        let formula = compact_formulas(matrix, vec![rhs], 0).unwrap().remove(0);
         assert!(formula.text().contains("^2"));
         for parameters in [
             [("K_a", 1.0), ("K_h", 2.0), ("K_t", 3.0), ("K_C", 4.0)],
@@ -566,6 +667,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fraction_free_elimination_handles_late_zero_pivots() {
+        // The leading 2x2 minor is a*b - b*a = 0, forcing a row swap at the second step.
+        let e = Expression::integer;
+        let (a, b, c, d) = (
+            Expression::symbol("a"),
+            Expression::symbol("b"),
+            Expression::symbol("c"),
+            Expression::symbol("d"),
+        );
+        let matrix = vec![
+            vec![a.clone(), b.clone(), e(0), e(1)],
+            vec![a.clone(), b.clone(), e(1), e(0)],
+            vec![e(0), e(1), c.clone(), e(0)],
+            vec![e(1), e(0), e(0), d.clone()],
+        ];
+        let rhs = vec![Expression::symbol("P"), e(0), Expression::symbol("Q"), e(2)];
+        let result = solve(matrix.clone(), rhs.clone()).unwrap();
+        for parameters in [
+            [
+                ("a", 2.0),
+                ("b", 3.0),
+                ("c", 5.0),
+                ("d", 7.0),
+                ("P", 1.0),
+                ("Q", -4.0),
+            ],
+            [
+                ("a", 0.5),
+                ("b", -1.5),
+                ("c", 2.0),
+                ("d", 0.3),
+                ("P", 9.0),
+                ("Q", 2.0),
+            ],
+        ] {
+            for (row, expected) in matrix.iter().zip(&rhs) {
+                let actual: f64 = row
+                    .iter()
+                    .zip(&result)
+                    .map(|(a, x)| evaluate(a, &parameters) * evaluate(x, &parameters))
+                    .sum();
+                assert!((actual - evaluate(expected, &parameters)).abs() < 1e-9);
+            }
+        }
+    }
     #[test]
     fn swaps_zero_pivot_rows() {
         let e = Expression::integer;

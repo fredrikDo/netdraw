@@ -8,6 +8,7 @@ use eframe::egui;
 use crate::element::{
     DIAGRAM_STROKE_WIDTH, ENDPOINT_INTERACTION_DISTANCE, ENDPOINT_RADIUS, Element,
     JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
+    unconnected_resistor_terminal_positions,
 };
 use crate::label::{LabelStyle, Placement};
 
@@ -42,12 +43,6 @@ pub fn draw_labels(
 
 pub fn draw_element(painter: &egui::Painter, element: Element) {
     match element {
-        Element::Line(start, end) => {
-            painter.line_segment(
-                [start, end],
-                egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK),
-            );
-        }
         Element::Resistor(start, end) => draw_resistor(painter, start, end),
         Element::PrescribedFlow(start, end) => draw_prescribed_flow(painter, start, end),
     }
@@ -115,15 +110,9 @@ pub fn draw_prescribed_flow_junction_nodes(painter: &egui::Painter, elements: &[
     }
 }
 
-// Mark resistor endpoints that are not connected to another element with a terminal tick.
+// Mark the solver's free terminals with a tick so the drawing shows what needs a label.
 pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[Element]) {
-    let all_endpoints: Vec<_> = elements
-        .iter()
-        .flat_map(|element| {
-            let (start, end) = element.endpoints();
-            [start, end]
-        })
-        .collect();
+    let terminals = unconnected_resistor_terminal_positions(elements);
 
     for element in elements {
         let Element::Resistor(start, end) = element else {
@@ -140,11 +129,7 @@ pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[
         let half_length = resistor_half_width(length);
 
         for position in [*start, *end] {
-            let connection_count = all_endpoints
-                .iter()
-                .filter(|other| **other == position)
-                .count();
-            if connection_count == 1 {
+            if terminals.contains(&position) {
                 painter.line_segment(
                     [
                         position - perpendicular * half_length,

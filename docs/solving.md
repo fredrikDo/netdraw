@@ -32,7 +32,6 @@ Editing the displayed result text does not change the drawing or the solver.
 | Drawing item | Meaning during solving |
 | --- | --- |
 | Zigzag labeled `G` | Conductance: flux from node `i` to `j` is `G*(p_i - p_j)` |
-| Plain line | Ideal connection: its endpoints have the same node value |
 | Free terminal label | Known node value, or boundary condition |
 | Internal node label | Name used when displaying that node's result |
 | Arrow labeled `Q` | Node-independent positive flux injection at its tip |
@@ -48,8 +47,9 @@ unsplit element do not create a connection. A flow arrow's tail is decorative.
 Labels are literal symbols after trimming surrounding whitespace. Reusing `K_a`
 means the same conductance in every occurrence; reusing `T_0` means the same
 boundary value. `G_1` and `g_1` are different symbols. Label typography does not
-parse algebra: `2*G`, `0`, and `-Q` are symbol names, not a product, a numerical zero,
-or a negative source. Prefer simple names such as `K_h`, `T_0`, and `Q_in` for
+parse algebra: `2*G` and `-Q` are symbol names, not a product or a negative source.
+Labels that are plain numbers, such as `0`, `1.5`, or `-2`, are rejected so a symbol
+can never be confused with a numerical value. Prefer simple names such as `K_h`, `T_0`, and `Q_in` for
 readable output. Numerical substitution and expression input are not implemented.
 
 ## Equations and examples
@@ -99,14 +99,13 @@ possible algebraic expression.
 
 ## Limits and validation
 
-Boundary label layout currently follows an attached zigzag axis. Although the solver
-accepts stored labels at free wire endpoints, those labels may not be displayed.
-For a visible editable boundary label, place the boundary at a zigzag endpoint.
+A free terminal is a zigzag endpoint shared with no other zigzag endpoint or arrow
+tip; arrow tails never connect. The canvas marks each one with a terminal tick, and
+each one needs a non-empty label. Empty labels are ignored.
 
 
 - At most **six unknown mathematical nodes** in the selected connected network.
-  Known boundary nodes do not count, and endpoints joined by wires count as one
-  node. Disconnected parts of the drawing are ignored.
+  Known boundary nodes do not count. Disconnected parts of the drawing are ignored.
 - At least one labeled known boundary is required. Label all conductances,
   prescribed fluxes, and free boundaries in the selected component.
 - Connected boundary terminals must agree on their label.

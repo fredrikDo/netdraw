@@ -84,17 +84,18 @@ Existing drawings retain their labels; labels formerly used as resistance names
 must now be interpreted or relabeled as conductances for solving.
 
 The solver assumes positive, finite conductances, conservation of flow, and positive
-injection at each flow arrow tip. Plain lines are ideal connections between their
-endpoints; crossings do not connect unless endpoints coincide. Free wire endpoints
-can also be labeled as pressure boundaries. Nodes joined by wires count as one node.
+injection at each flow arrow tip. Elements connect only where endpoints coincide;
+crossings do not connect. Every free zigzag endpoint (marked with a terminal tick)
+must be labeled as a pressure boundary.
 
 The selected connected network may contain up to six unknown pressure nodes and
 must have a known pressure boundary. Unrelated disconnected drawings are ignored.
-Exact symbolic arithmetic runs locally in Rust. Simplification combines terms and
-cancels numeric, monomial, and shared polynomial factors encountered during
-elimination. Cancellation uses exact integer polynomial division; general
-polynomial factoring is not included. Complex expressions may reach a size limit
-before the node limit.
+Exact symbolic arithmetic runs locally in Rust, using fraction-free elimination so
+intermediate expressions stay no larger than the determinants of the system.
+Simplification cancels numeric, monomial, and shared polynomial factors; general
+polynomial factoring is not included. Very dense networks may still reach a size
+limit before the node limit. Labels that are plain numbers (such as `0`) are
+rejected; use symbol names such as `T_0`.
 
 When several boundaries share a label, the most frequent shared value becomes the
 reference. The result is expressed as that reference plus weighted boundary
