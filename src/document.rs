@@ -11,6 +11,7 @@ use crate::{
     label::{LabelFont, LabelStyle, NodeLabel},
 };
 
+/// Format version written by this build; loading rejects every other version.
 const CURRENT_VERSION: u32 = 1;
 
 /// Persistent document state shared by saving, history, export, and solving.
@@ -50,6 +51,7 @@ impl Drawing {
     }
 }
 
+/// On-disk layout of a `.netdraw` file; see `docs/file-format.md`.
 #[derive(Serialize, Deserialize)]
 struct SavedDrawing {
     version: u32,
@@ -60,6 +62,7 @@ struct SavedDrawing {
     label_style: SavedLabelStyle,
 }
 
+/// Element tagged by `"type"`. Positions are `[x, y]` in canvas coordinates.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SavedElement {
@@ -88,6 +91,8 @@ struct SavedLabelStyle {
     size: f32,
 }
 
+/// Serialized font names. Aliases map retired fonts to their current replacements
+/// (see `assets/fonts/README.md`); only the primary name is ever written.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SavedFont {
@@ -165,8 +170,7 @@ impl Drawing {
         if positions
             .into_iter()
             .any(|position| !position.x.is_finite() || !position.y.is_finite())
-            || !self.label_style.size.is_finite()
-            || !(8.0..=48.0).contains(&self.label_style.size)
+            || !LabelStyle::SIZE_RANGE.contains(&self.label_style.size)
         {
             return Err(String::from(
                 "Invalid NetDraw file: coordinates or typography are out of range.",

@@ -72,7 +72,9 @@ See [the file format](file-format.md).
 
 ## Rendering and export
 
-Canvas painting and export share geometry and label layout helpers. The SVG
+Canvas painting and export share geometry helpers in `element.rs` (`resistor_body`,
+`prescribed_flow_symbol`, `terminal_ticks`, `junction_positions`) and one label
+layout entry point, `LabelLayout::compute`. The SVG
 export embeds the selected bundled font and computes bounds from geometry and
 labels. Clipboard output rasterizes that SVG onto white, excludes editor overlays,
 and rejects excessive raster dimensions. Keep the clipboard owner alive on Linux
@@ -86,8 +88,8 @@ cropping or misplaced scripts.
 
 ### 1. Build topology
 
-`drawing_topology` gathers connectable endpoints; each distinct position is one
-node, identified by its index. `connected_component` traverses conductance edges from the
+`Topology::new` gathers connectable endpoints; each distinct position is one
+node, identified by its index. It also computes the free terminal positions once. `connected_component` traverses conductance edges from the
 selection. Only that component is validated and solved.
 
 Only a prescribed-flow arrow's tip enters topology. The arrow is an external
@@ -116,9 +118,9 @@ For each edge of conductance `G` from unknown node `i` to node `j`:
 - Add prescribed inflows directly to `b[i]`, independently of `p_i`.
 
 This produces `A*x = b`. Edges whose endpoints are the same mathematical node
-carry no node difference and do not contribute. `build_equations_with_sources`
-accepts a source-value callback so physical equations and unit-response equations
-share the same assembly logic.
+carry no node difference and do not contribute. `conductance_matrix` builds `A`
+once; `right_hand_side` accepts a source-value callback so physical equations and
+unit-response equations share the same assembly logic.
 
 ### 4. Separate a shared reference
 
@@ -154,7 +156,7 @@ Current work limits in `symbolic.rs`:
 | Polynomial terms | 2,048 retained terms |
 | Multiplication precheck | At most 2^20 input term pairs |
 | Elimination cross products | At most 16,384 terms before the exact division |
-| Exact-division loop | At most 2,048 iterations per attempt |
+| Exact-division loop | At most 2,048 iterations, and 8,192 remainder terms, per attempt |
 | Tracked factor candidates | At most 64 per expression |
 
 `solve_target` uses fraction-free (Bareiss) elimination on the augmented matrix

@@ -2,7 +2,7 @@
 Type=Application
 Name=NetDraw
 Comment=Create and edit network diagrams
-Exec=Netdraw
+Exec=netdraw
 Icon=netdraw
 Terminal=false
 Categories=Graphics;Engineering;

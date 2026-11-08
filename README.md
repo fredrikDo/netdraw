@@ -113,7 +113,7 @@ The application uses the blue resistor icon in `assets/icons/netdraw.svg`. The w
 Linux desktop launchers, including Wayland desktops, use the supplied desktop entry and installed icon. After `cargo build --release`, install them for your user with:
 
 ```sh
-install -Dm755 target/release/Netdraw ~/.local/bin/Netdraw
+install -Dm755 target/release/netdraw ~/.local/bin/netdraw
 install -Dm644 assets/icons/netdraw.svg ~/.local/share/icons/hicolor/scalable/apps/netdraw.svg
 install -Dm644 assets/icons/netdraw.png ~/.local/share/icons/hicolor/256x256/apps/netdraw.png
 install -Dm644 packaging/linux/netdraw.desktop ~/.local/share/applications/netdraw.desktop

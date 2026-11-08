@@ -4,21 +4,19 @@
 //! dialogs, and clipboard ownership belong only to this controller.
 
 use eframe::egui;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use crate::{
     document::Drawing,
     element::{
-        DraggedEndpoint, DrawMode, ENDPOINT_RADIUS, Element, element_at, endpoint_at,
-        endpoints_in_rect, junction_positions, overlapping_endpoints, snap_to_endpoint,
-        unconnected_resistor_terminal_positions,
+        DraggedEndpoint, DrawMode, ELEMENT_HIT_DISTANCE, ENDPOINT_RADIUS, Element,
+        MIN_ELEMENT_LENGTH, element_at, endpoint_at, endpoints_in_rect, junction_positions,
+        overlapping_endpoints, snap_to_endpoint, unconnected_resistor_terminal_positions,
     },
     exporter,
-    renderer::{
-        draw_element, draw_elements, draw_endpoint_handles, draw_labels,
-        draw_prescribed_flow_junction_nodes, draw_resistor_junction_nodes,
-        draw_unconnected_resistor_terminals,
-    },
+    label::{LabelFont, LabelLayout, LabelStyle, NodeLabel},
+    renderer::{draw_diagram, draw_element, draw_endpoint_handles, draw_labels},
 };
 
 const CANVAS_SIZE: egui::Vec2 = egui::Vec2::new(2_400.0, 1_800.0);
@@ -29,7 +27,10 @@ const TOOL_BUTTON_SIZE: f32 = 36.0;
 const TOOL_BUTTON_BACKGROUND: egui::Color32 = egui::Color32::BLACK;
 const SELECTED_TOOL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(28, 100, 190);
 const SELECTED_TOOL_BORDER: egui::Color32 = egui::Color32::from_rgb(125, 195, 255);
+/// Oldest undo steps are discarded beyond this many snapshots.
+const MAX_UNDO_STEPS: usize = 100;
 
+/// Glyph painted on a toolbar button; see `Canvas::paint_tool_icon`.
 #[derive(Clone, Copy)]
 enum ToolIcon {
     Solve,
@@ -48,6 +49,7 @@ enum ToolIcon {
     EqualLengths,
 }
 
+/// Open the main window and run the event loop until the window closes.
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -62,6 +64,10 @@ pub fn run() -> eframe::Result<()> {
     })
 }
 
+/// Modelling assumptions shown under every solved expression.
+const SOLVE_ASSUMPTIONS: &str = "Assumes positive, finite conductances. Flow arrows inject \
+    positive flow. Terminal labels are known pressures; other labels are literal symbols.";
+
 /// A solve runs on a worker thread so large networks never block the UI.
 /// Dropping the receiver (closing the dialog or solving again) discards a stale result.
 enum SolveState {
@@ -69,44 +75,61 @@ enum SolveState {
     Done(Result<String, String>),
 }
 
-/// UI owner. `drawing()` extracts the persistent subset for pure downstream operations.
+/// UI owner. `doc` is the persistent document; every other field is transient UI state.
 struct Canvas {
-    elements: Vec<Element>,
-    labels: Vec<String>,
-    node_labels: Vec<crate::label::NodeLabel>,
-    terminal_labels: Vec<crate::label::NodeLabel>,
-    // Set only while a new element is being drawn.
+    /// The document being edited, in canvas coordinates. Saved, exported, and solved as is.
+    doc: Drawing,
+    // --- Pointer interaction. Element indices here are invalid after any removal. ---
+    /// Snapped start point, set only while a new element is being drawn.
     start: Option<egui::Pos2>,
-    // Set while moving one or more connected endpoints of completed elements.
+    /// Endpoints being moved; the first entry is the anchor that snapping applies to.
     dragged_endpoints: Vec<DraggedEndpoint>,
+    /// Positions of `dragged_endpoints` when the drag began, in the same order.
     dragged_endpoint_origins: Vec<egui::Pos2>,
+    /// Pointer position when the drag began.
     drag_origin: Option<egui::Pos2>,
+    /// Position labels that sat on a dragged endpoint when the drag began. They follow
+    /// it by identity, so passing over other endpoints neither steals nor deletes labels.
+    dragged_labels: Vec<DraggedLabel>,
     selected_endpoints: Vec<DraggedEndpoint>,
+    /// Corner of the rubber-band selection rectangle while it is being dragged.
     selection_start: Option<egui::Pos2>,
+    /// Edge detector so a press is handled once, not on every frame it is held.
     selection_pointer_down: bool,
+    /// Selected endpoint under the press; dragging it moves the whole selection.
     selection_drag_anchor: Option<DraggedEndpoint>,
     draw_mode: DrawMode,
     grid_enabled: bool,
+    editing_label: Option<EditingLabel>,
+    // --- Dialogs and status messages. ---
     export_dialog_open: bool,
     export_path: String,
     export_status: Option<String>,
+    /// Kept alive after copying: on Linux the owner must exist for others to paste.
     clipboard: Option<arboard::Clipboard>,
     clipboard_status: Option<String>,
     label_style_dialog_open: bool,
-    label_style: crate::label::LabelStyle,
+    help_window: Option<HelpWindow>,
+    /// Last label layout (canvas coordinates) and the inputs it was computed from.
+    label_layout_cache: Option<LabelLayoutCache>,
     fonts_installed: bool,
-    editing_label: Option<EditingLabel>,
-    current_path: Option<PathBuf>,
-    clean_drawing: Drawing,
-    history_drawing: Drawing,
-    undo_stack: Vec<Drawing>,
-    redo_stack: Vec<Drawing>,
     solve: Option<SolveState>,
     file_status: Option<String>,
+    // --- Files and history. ---
+    current_path: Option<PathBuf>,
+    /// Document as last saved or opened; `doc != clean_drawing` means unsaved changes.
+    clean_drawing: Drawing,
+    /// Document as of the last recorded undo step; see `record_edit`.
+    history_drawing: Drawing,
+    undo_stack: VecDeque<Drawing>,
+    redo_stack: Vec<Drawing>,
+    /// Action waiting for the unsaved-changes dialog to be answered.
     pending_file_action: Option<FileAction>,
+    /// Set once the user has confirmed quitting, so the close request is not cancelled again.
     allow_close: bool,
 }
 
+/// File actions that would discard the current document and so need confirmation.
 #[derive(Clone, Copy)]
 enum FileAction {
     New,
@@ -114,6 +137,69 @@ enum FileAction {
     Quit,
 }
 
+/// Windows opened from the Help menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelpWindow {
+    Guide,
+    About,
+}
+
+/// Quick-guide entries as (topic, explanation). The README and `docs/` hold the full text.
+const HELP_TOPICS: &[(&str, &str)] = &[
+    (
+        "Draw",
+        "Pick Conductance or Prescribed flow, then drag on the canvas. Endpoints \
+         dropped near another endpoint snap to it and join the network.",
+    ),
+    (
+        "Select and move",
+        "With the select tool, click an endpoint or drag a box around several. Drag a \
+         selected endpoint to move the whole selection. Delete or Backspace removes the \
+         selected elements.",
+    ),
+    (
+        "Arrange",
+        "Grid shows a 20 px grid and snaps to it. With two or more endpoints selected, \
+         align them or equalize the connected lengths.",
+    ),
+    (
+        "Label",
+        "With the label tool, click an element, a junction, or a free terminal (marked \
+         with a tick). Write R_1 for a subscript, x^2 for a superscript, R_(total) for a \
+         group, and \\_ for a literal underscore. Press Enter to finish.",
+    ),
+    (
+        "Solve",
+        "Label every conductance, flow arrow, and free terminal (with its known \
+         pressure). Select one node and click Solve (=). Up to six unknown nodes.",
+    ),
+    (
+        "Files and output",
+        "Save and Open use editable .netdraw files. File > Export writes an SVG; the \
+         camera button copies a cropped image to the clipboard.",
+    ),
+    ("Undo", "Ctrl+Z undoes and Ctrl+Y redoes completed edits."),
+];
+
+/// A node or terminal label attached to one of `Canvas::dragged_endpoints`.
+#[derive(Clone, Copy)]
+struct DraggedLabel {
+    /// Index into `terminal_labels` if true, otherwise into `node_labels`.
+    is_terminal: bool,
+    label_index: usize,
+    /// Index into `dragged_endpoints` / `dragged_endpoint_origins`.
+    endpoint_index: usize,
+}
+
+/// Label placement is a collision search over every element and label, so it is only
+/// redone when the document or the open label editor changes, not on every frame.
+struct LabelLayoutCache {
+    doc: Drawing,
+    editing_label: Option<EditingLabel>,
+    layout: LabelLayout,
+}
+
+/// Which label the inline editor is open for, by index into the matching `Drawing` vector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum EditingLabel {
     Element(usize),
@@ -124,14 +210,12 @@ enum EditingLabel {
 impl Default for Canvas {
     fn default() -> Self {
         Self {
-            elements: Vec::new(),
-            labels: Vec::new(),
-            node_labels: Vec::new(),
-            terminal_labels: Vec::new(),
+            doc: Drawing::empty(),
             start: None,
             dragged_endpoints: Vec::new(),
             dragged_endpoint_origins: Vec::new(),
             drag_origin: None,
+            dragged_labels: Vec::new(),
             selected_endpoints: Vec::new(),
             selection_start: None,
             selection_pointer_down: false,
@@ -144,13 +228,14 @@ impl Default for Canvas {
             clipboard: None,
             clipboard_status: None,
             label_style_dialog_open: false,
-            label_style: crate::label::LabelStyle::default(),
+            help_window: None,
+            label_layout_cache: None,
             fonts_installed: false,
             editing_label: None,
             current_path: None,
             clean_drawing: Drawing::empty(),
             history_drawing: Drawing::empty(),
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
             solve: None,
             file_status: None,
@@ -161,6 +246,7 @@ impl Default for Canvas {
 }
 
 impl Canvas {
+    /// Draw one frame of the whole window and handle its input.
     fn show(&mut self, ui: &mut egui::Ui) {
         Self::apply_button_colors(ui);
         if !self.fonts_installed {
@@ -175,6 +261,7 @@ impl Canvas {
         self.show_export_dialog(ui.ctx());
         self.show_label_style_dialog(ui.ctx());
         self.show_unsaved_changes_dialog(ui.ctx());
+        self.show_help_window(ui.ctx());
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -186,6 +273,7 @@ impl Canvas {
         }
     }
 
+    /// White-on-black buttons and menus, matching the toolbar.
     fn apply_button_colors(ui: &mut egui::Ui) {
         let widgets = &mut ui.style_mut().visuals.widgets;
         for visuals in [
@@ -199,6 +287,7 @@ impl Canvas {
         }
     }
 
+    /// The scrollable drawing surface: input handling first, then painting in z-order.
     fn show_canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(CANVAS_SIZE, egui::Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, CANVAS_BACKGROUND);
@@ -218,151 +307,136 @@ impl Canvas {
 
         // Geometry is stored relative to the scrollable canvas but rendered in screen space.
         let screen_elements: Vec<_> = self
+            .doc
             .elements
             .iter()
             .map(|element| element.translated(origin))
             .collect();
-        draw_elements(&painter, &screen_elements);
-        draw_unconnected_resistor_terminals(&painter, &screen_elements);
+        draw_diagram(&painter, &screen_elements);
         draw_endpoint_handles(&painter, &screen_elements, response.hover_pos());
-        draw_resistor_junction_nodes(&painter, &screen_elements);
-        draw_prescribed_flow_junction_nodes(&painter, &screen_elements);
         self.draw_selection(&painter, pointer_position, origin);
-        // An empty label still needs a temporary location while its editor is open.
-        let mut layout_labels = self.labels.clone();
-        if let Some(EditingLabel::Element(index)) = self.editing_label
-            && layout_labels.get(index).is_some_and(String::is_empty)
-        {
-            layout_labels[index] = String::from(" ");
-        }
-        let label_placements =
-            crate::label::placements(ui.ctx(), &self.elements, &layout_labels, self.label_style);
-        let mut layout_node_labels = self.node_labels.clone();
-        if let Some(EditingLabel::Node(index)) = self.editing_label
-            && layout_node_labels
-                .get(index)
-                .is_some_and(|label| label.text.is_empty())
-        {
-            layout_node_labels[index].text = String::from(" ");
-        }
-        let node_label_placements = crate::label::node_placements(
-            ui.ctx(),
-            &self.elements,
-            &layout_node_labels,
-            &label_placements,
-            self.label_style,
-        );
-        let mut layout_terminal_labels = self.terminal_labels.clone();
-        if let Some(EditingLabel::Terminal(index)) = self.editing_label
-            && layout_terminal_labels
-                .get(index)
-                .is_some_and(|label| label.text.is_empty())
-        {
-            layout_terminal_labels[index].text = String::from(" ");
-        }
-        let mut occupied_label_placements = label_placements.clone();
-        occupied_label_placements.extend(node_label_placements.iter().copied());
-        let terminal_label_placements = crate::label::terminal_placements(
-            ui.ctx(),
-            &self.elements,
-            &layout_terminal_labels,
-            &occupied_label_placements,
-            self.label_style,
-        );
-        let screen_label_placements: Vec<_> = label_placements
-            .iter()
-            .map(|placement| {
-                placement.map(|placement| crate::label::Placement {
-                    rect: placement.rect.translate(origin),
-                })
-            })
-            .collect();
-        let screen_node_label_placements: Vec<_> = node_label_placements
-            .iter()
-            .map(|placement| {
-                placement.map(|placement| crate::label::Placement {
-                    rect: placement.rect.translate(origin),
-                })
-            })
-            .collect();
-        let screen_terminal_label_placements: Vec<_> = terminal_label_placements
-            .iter()
-            .map(|placement| {
-                placement.map(|placement| crate::label::Placement {
-                    rect: placement.rect.translate(origin),
-                })
-            })
-            .collect();
+
+        let layout = self.cached_label_layout(ui.ctx()).translated(origin);
+        let style = self.doc.label_style;
+        // The label being edited is hidden; its inline editor is drawn in its place.
+        let (editing_element, editing_node, editing_terminal) = match self.editing_label {
+            Some(EditingLabel::Element(index)) => (Some(index), None, None),
+            Some(EditingLabel::Node(index)) => (None, Some(index), None),
+            Some(EditingLabel::Terminal(index)) => (None, None, Some(index)),
+            None => (None, None, None),
+        };
         draw_labels(
             &painter,
-            &self.labels,
-            &screen_label_placements,
-            self.editing_label.and_then(|editing| match editing {
-                EditingLabel::Element(index) => Some(index),
-                EditingLabel::Node(_) => None,
-                EditingLabel::Terminal(_) => None,
-            }),
-            self.label_style,
+            self.doc.labels.iter().map(String::as_str),
+            &layout.elements,
+            editing_element,
+            style,
         );
-        let node_label_text: Vec<_> = self
-            .node_labels
-            .iter()
-            .map(|label| label.text.clone())
-            .collect();
         draw_labels(
             &painter,
-            &node_label_text,
-            &screen_node_label_placements,
-            self.editing_label.and_then(|editing| match editing {
-                EditingLabel::Node(index) => Some(index),
-                EditingLabel::Element(_) => None,
-                EditingLabel::Terminal(_) => None,
-            }),
-            self.label_style,
+            self.doc.node_labels.iter().map(|label| label.text.as_str()),
+            &layout.nodes,
+            editing_node,
+            style,
         );
-        let terminal_label_text: Vec<_> = self
-            .terminal_labels
-            .iter()
-            .map(|label| label.text.clone())
-            .collect();
         draw_labels(
             &painter,
-            &terminal_label_text,
-            &screen_terminal_label_placements,
-            self.editing_label.and_then(|editing| match editing {
-                EditingLabel::Terminal(index) => Some(index),
-                EditingLabel::Element(_) | EditingLabel::Node(_) => None,
-            }),
-            self.label_style,
+            self.doc
+                .terminal_labels
+                .iter()
+                .map(|label| label.text.as_str()),
+            &layout.terminals,
+            editing_terminal,
+            style,
         );
         self.draw_preview(&painter, pointer_position, origin);
         self.finish_drag(&response, pointer_position);
-        self.show_label_editor(
-            ui,
-            &screen_label_placements,
-            &screen_node_label_placements,
-            &screen_terminal_label_placements,
-        );
+        self.show_label_editor(ui, &layout);
     }
 
+    /// Label layout in canvas coordinates, recomputed only when its inputs change.
+    /// Comparing the document is a linear scan, far cheaper than the placement search.
+    /// (Fonts are installed once on the first frame, before any layout.)
+    fn cached_label_layout(&mut self, ctx: &egui::Context) -> &LabelLayout {
+        let stale = self
+            .label_layout_cache
+            .as_ref()
+            .is_none_or(|cache| cache.editing_label != self.editing_label || cache.doc != self.doc);
+        if stale {
+            self.label_layout_cache = Some(LabelLayoutCache {
+                layout: self.label_layout(ctx),
+                doc: self.doc.clone(),
+                editing_label: self.editing_label,
+            });
+        }
+        &self.label_layout_cache.as_ref().unwrap().layout
+    }
+
+    /// Label layout in canvas coordinates. A label whose editor is open but still empty is
+    /// laid out as a space, so the editor has a position to appear at.
+    fn label_layout(&self, ctx: &egui::Context) -> LabelLayout {
+        let mut doc = std::borrow::Cow::Borrowed(&self.doc);
+        let editing_text = match self.editing_label {
+            Some(EditingLabel::Element(index)) => self.doc.labels.get(index),
+            Some(EditingLabel::Node(index)) => self.doc.node_labels.get(index).map(|l| &l.text),
+            Some(EditingLabel::Terminal(index)) => {
+                self.doc.terminal_labels.get(index).map(|l| &l.text)
+            }
+            None => None,
+        };
+        // Clone only in the rare frame where an empty label is being edited.
+        if editing_text.is_some_and(String::is_empty) {
+            let doc = doc.to_mut();
+            match self.editing_label {
+                Some(EditingLabel::Element(index)) => doc.labels[index] = " ".into(),
+                Some(EditingLabel::Node(index)) => doc.node_labels[index].text = " ".into(),
+                Some(EditingLabel::Terminal(index)) => doc.terminal_labels[index].text = " ".into(),
+                None => {}
+            }
+        }
+        LabelLayout::compute(
+            ctx,
+            &doc.elements,
+            &doc.labels,
+            &doc.node_labels,
+            &doc.terminal_labels,
+            doc.label_style,
+        )
+    }
+
+    /// Paint grid lines over `rect` (the whole canvas, in screen space), skipping lines
+    /// outside the visible part of the scroll area.
     fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
         let stroke = egui::Stroke::new(1.0, GRID_COLOR);
-        for column in 0..=(CANVAS_SIZE.x / GRID_SPACING) as usize {
-            let x = rect.left() + column as f32 * GRID_SPACING;
+        let visible = painter.clip_rect().intersect(rect);
+        // Grid lines are at `rect.min + k * GRID_SPACING`; find the visible range of k.
+        let first =
+            |min: f32, visible_min: f32| ((visible_min - min) / GRID_SPACING).ceil().max(0.0);
+        let mut x = rect.left() + first(rect.left(), visible.left()) * GRID_SPACING;
+        while x <= visible.right() {
             painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                [
+                    egui::pos2(x, visible.top()),
+                    egui::pos2(x, visible.bottom()),
+                ],
                 stroke,
             );
+            x += GRID_SPACING;
         }
-        for row in 0..=(CANVAS_SIZE.y / GRID_SPACING) as usize {
-            let y = rect.top() + row as f32 * GRID_SPACING;
+        let mut y = rect.top() + first(rect.top(), visible.top()) * GRID_SPACING;
+        while y <= visible.bottom() {
             painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                [
+                    egui::pos2(visible.left(), y),
+                    egui::pos2(visible.right(), y),
+                ],
                 stroke,
             );
+            y += GRID_SPACING;
         }
     }
 
+    /// Grid intersections are at multiples of `GRID_SPACING` in canvas coordinates.
     fn nearest_grid_intersection(position: egui::Pos2) -> egui::Pos2 {
         egui::pos2(
             (position.x / GRID_SPACING).round() * GRID_SPACING,
@@ -370,31 +444,26 @@ impl Canvas {
         )
     }
 
+    /// Snap each selected endpoint to its nearest intersection, even with the grid hidden.
     fn snap_selected_to_grid(&mut self) {
-        let previous_positions: Vec<_> = self
-            .selected_endpoints
-            .iter()
-            .map(|endpoint| {
-                let (start, end) = self.elements[endpoint.element_index].endpoints();
-                if endpoint.is_start { start } else { end }
-            })
-            .collect();
+        let previous_positions = self.endpoint_positions(&self.selected_endpoints);
         let new_positions: Vec<_> = previous_positions
             .iter()
             .copied()
             .map(Self::nearest_grid_intersection)
             .collect();
         for (endpoint, position) in self.selected_endpoints.iter().zip(&new_positions) {
-            self.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
+            self.doc.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
         }
         self.update_endpoint_labels(&previous_positions, &new_positions);
     }
 
+    /// Snap a pointer position: to the grid when it is on, otherwise to a nearby endpoint.
     fn snap_position(&self, position: egui::Pos2, ignored: &[DraggedEndpoint]) -> egui::Pos2 {
         if self.grid_enabled {
             Self::nearest_grid_intersection(position)
         } else {
-            snap_to_endpoint(&self.elements, position, ignored)
+            snap_to_endpoint(&self.doc.elements, position, ignored)
         }
     }
 
@@ -430,8 +499,7 @@ impl Canvas {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                let can_undo =
-                    !self.undo_stack.is_empty() || self.drawing() != self.history_drawing;
+                let can_undo = !self.undo_stack.is_empty() || self.doc != self.history_drawing;
                 if ui
                     .add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z"))
                     .clicked()
@@ -441,7 +509,7 @@ impl Canvas {
                 }
                 if ui
                     .add_enabled(
-                        !self.redo_stack.is_empty() && self.drawing() == self.history_drawing,
+                        !self.redo_stack.is_empty() && self.doc == self.history_drawing,
                         egui::Button::new("Redo").shortcut_text("Ctrl+Y"),
                     )
                     .clicked()
@@ -451,7 +519,14 @@ impl Canvas {
                 }
             });
             ui.menu_button("Help", |ui| {
-                ui.label("Help information will appear here.");
+                if ui.button("Quick guide").clicked() {
+                    self.help_window = Some(HelpWindow::Guide);
+                    ui.close();
+                }
+                if ui.button("About NetDraw").clicked() {
+                    self.help_window = Some(HelpWindow::About);
+                    ui.close();
+                }
             });
             ui.separator();
             let name = self
@@ -470,52 +545,50 @@ impl Canvas {
 
     /// Snapshot only document state; exclude interaction state and calculated results.
     fn drawing(&self) -> Drawing {
-        Drawing {
-            elements: self.elements.clone(),
-            labels: self.labels.clone(),
-            node_labels: self.node_labels.clone(),
-            terminal_labels: self.terminal_labels.clone(),
-            label_style: self.label_style,
-        }
+        self.doc.clone()
     }
 
     /// Commit one completed editing gesture, cap history, and invalidate the redo branch.
+    /// Called every idle frame, so it compares first and only clones when something changed.
     fn record_edit(&mut self) {
-        let drawing = self.drawing();
-        if drawing != self.history_drawing {
-            self.undo_stack
-                .push(std::mem::replace(&mut self.history_drawing, drawing));
-            if self.undo_stack.len() > 100 {
-                self.undo_stack.remove(0);
+        if self.doc != self.history_drawing {
+            let previous = std::mem::replace(&mut self.history_drawing, self.doc.clone());
+            self.undo_stack.push_back(previous);
+            if self.undo_stack.len() > MAX_UNDO_STEPS {
+                self.undo_stack.pop_front();
             }
             self.redo_stack.clear();
         }
     }
 
+    /// Start a fresh history at the current document (after New or Open).
     fn reset_history(&mut self) {
         self.history_drawing = self.drawing();
         self.undo_stack.clear();
         self.redo_stack.clear();
     }
 
+    /// Record any in-progress change first, so undo never skips past it.
     fn undo(&mut self) {
         self.record_edit();
-        if let Some(drawing) = self.undo_stack.pop() {
+        if let Some(drawing) = self.undo_stack.pop_back() {
             self.redo_stack.push(self.drawing());
             self.history_drawing = drawing.clone();
             self.apply_drawing(drawing);
         }
     }
 
+    /// Re-apply the last undone step; any new edit has already cleared the redo stack.
     fn redo(&mut self) {
         self.record_edit();
         if let Some(drawing) = self.redo_stack.pop() {
-            self.undo_stack.push(self.drawing());
+            self.undo_stack.push_back(self.drawing());
             self.history_drawing = drawing.clone();
             self.apply_drawing(drawing);
         }
     }
 
+    /// Ctrl+Z / Ctrl+Y, unless a text field has keyboard focus.
     fn handle_edit_shortcuts(&mut self, ctx: &egui::Context) {
         // Let text fields handle their own undo while they have keyboard focus.
         if ctx.egui_wants_keyboard_input() {
@@ -528,8 +601,9 @@ impl Canvas {
         }
     }
 
+    /// Whether the document differs from the last save or open.
     fn is_dirty(&self) -> bool {
-        self.drawing() != self.clean_drawing
+        self.doc != self.clean_drawing
     }
 
     /// Defer destructive document replacement until unsaved changes are resolved.
@@ -541,6 +615,7 @@ impl Canvas {
         }
     }
 
+    /// Carry out a file action unconditionally; callers have resolved unsaved changes.
     fn perform_file_action(&mut self, action: FileAction, ctx: &egui::Context) {
         match action {
             FileAction::New => self.new_drawing(),
@@ -552,6 +627,7 @@ impl Canvas {
         }
     }
 
+    /// Intercept the window's close button while there are unsaved changes.
     fn handle_window_close(&mut self, ctx: &egui::Context) {
         if !self.allow_close
             && ctx.input(|input| input.viewport().close_requested())
@@ -564,6 +640,52 @@ impl Canvas {
         }
     }
 
+    /// Quick guide or About window, whichever the Help menu last opened.
+    fn show_help_window(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.help_window else {
+            return;
+        };
+        let mut open = true;
+        match window {
+            HelpWindow::Guide => {
+                egui::Window::new("Quick guide")
+                    .open(&mut open)
+                    .default_width(440.0)
+                    .show(ctx, |ui| {
+                        egui::Grid::new("help_topics")
+                            .num_columns(2)
+                            .spacing([12.0, 10.0])
+                            .show(ui, |ui| {
+                                for (topic, text) in HELP_TOPICS {
+                                    ui.strong(*topic);
+                                    ui.add(egui::Label::new(*text).wrap());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+            HelpWindow::About => {
+                egui::Window::new("About NetDraw")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.heading("NetDraw");
+                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                        ui.label(
+                            "Draw conductance networks, solve node values symbolically, \
+                             and export clean diagrams.",
+                        );
+                        ui.label("Pre-release: the file format may still change.");
+                    });
+            }
+        }
+        if !open {
+            self.help_window = None;
+        }
+    }
+
+    /// Save / Discard / Cancel prompt for `pending_file_action`.
     fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
         let Some(action) = self.pending_file_action else {
             return;
@@ -590,6 +712,7 @@ impl Canvas {
             });
     }
 
+    /// Save to the current path, or ask for one. Returns whether the save succeeded.
     fn save(&mut self) -> bool {
         match self.current_path.clone() {
             Some(path) => self.save_to(path),
@@ -597,6 +720,7 @@ impl Canvas {
         }
     }
 
+    /// Ask for a path (adding `.netdraw` if no extension is given) and save there.
     fn save_as(&mut self) -> bool {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("NetDraw drawing", &["netdraw"])
@@ -643,6 +767,7 @@ impl Canvas {
         }
     }
 
+    /// Pick and load a drawing; on failure the current document is left untouched.
     fn open(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("NetDraw drawing", &["netdraw"]);
         if let Some(parent) = self.current_path.as_deref().and_then(Path::parent) {
@@ -666,6 +791,7 @@ impl Canvas {
         }
     }
 
+    /// Replace the document with an empty one; callers resolve unsaved changes first.
     fn new_drawing(&mut self) {
         let drawing = Drawing::empty();
         self.apply_drawing(drawing.clone());
@@ -677,15 +803,18 @@ impl Canvas {
 
     /// Replace persistent state and clear handles/indices belonging to the previous geometry.
     fn apply_drawing(&mut self, drawing: Drawing) {
-        self.elements = drawing.elements;
-        self.labels = drawing.labels;
-        self.node_labels = drawing.node_labels;
-        self.terminal_labels = drawing.terminal_labels;
-        self.label_style = drawing.label_style;
+        self.doc = drawing;
+        self.clear_interaction_state();
+    }
+
+    /// Forget every selection, drag, and open label editor. Required whenever element
+    /// indices may have changed meaning.
+    fn clear_interaction_state(&mut self) {
         self.start = None;
         self.dragged_endpoints.clear();
         self.dragged_endpoint_origins.clear();
         self.drag_origin = None;
+        self.dragged_labels.clear();
         self.selected_endpoints.clear();
         self.selection_start = None;
         self.selection_pointer_down = false;
@@ -693,6 +822,7 @@ impl Canvas {
         self.editing_label = None;
     }
 
+    /// "Export SVG" window: path entry, file browser, and save.
     fn show_export_dialog(&mut self, ctx: &egui::Context) {
         if !self.export_dialog_open {
             return;
@@ -724,22 +854,15 @@ impl Canvas {
                         if path.is_empty() {
                             self.export_status = Some(String::from("Enter a file name."));
                         } else {
-                            let path = if path.ends_with(".svg") {
+                            let has_svg_extension = Path::new(path)
+                                .extension()
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
+                            let path = if has_svg_extension {
                                 path.to_owned()
                             } else {
                                 format!("{path}.svg")
                             };
-                            match std::fs::write(
-                                &path,
-                                exporter::svg(
-                                    ctx,
-                                    &self.elements,
-                                    &self.labels,
-                                    &self.node_labels,
-                                    &self.terminal_labels,
-                                    self.label_style,
-                                ),
-                            ) {
+                            match std::fs::write(&path, exporter::svg(ctx, &self.doc)) {
                                 Ok(()) => {
                                     self.export_status = Some(format!("Saved {path}"));
                                     close_dialog = true;
@@ -762,6 +885,7 @@ impl Canvas {
         }
     }
 
+    /// Native save dialog seeded from the path typed so far.
     fn choose_export_path(current_path: &str) -> Option<String> {
         let path = Path::new(current_path);
         let mut dialog = rfd::FileDialog::new()
@@ -784,6 +908,7 @@ impl Canvas {
             .map(|path| path.to_string_lossy().into_owned())
     }
 
+    /// "Label typography" window: font and size apply to every label at once.
     fn show_label_style_dialog(&mut self, ctx: &egui::Context) {
         if !self.label_style_dialog_open {
             return;
@@ -801,11 +926,11 @@ impl Canvas {
                     .show(ui, |ui| {
                         ui.label("Font");
                         egui::ComboBox::from_id_salt("label_font")
-                            .selected_text(self.label_style.font.display_name())
+                            .selected_text(self.doc.label_style.font.display_name())
                             .show_ui(ui, |ui| {
-                                for font in crate::label::LabelFont::ALL {
+                                for font in LabelFont::ALL {
                                     ui.selectable_value(
-                                        &mut self.label_style.font,
+                                        &mut self.doc.label_style.font,
                                         font,
                                         font.display_name(),
                                     );
@@ -815,8 +940,8 @@ impl Canvas {
 
                         ui.label("Font size");
                         ui.add(
-                            egui::DragValue::new(&mut self.label_style.size)
-                                .range(8.0..=48.0)
+                            egui::DragValue::new(&mut self.doc.label_style.size)
+                                .range(LabelStyle::SIZE_RANGE)
                                 .speed(0.5)
                                 .suffix(" px"),
                         );
@@ -824,21 +949,15 @@ impl Canvas {
                     });
 
                 ui.separator();
-                ui.label(egui::RichText::new("Label preview").font(self.label_style.font_id()));
+                ui.label(egui::RichText::new("Label preview").font(self.doc.label_style.font_id()));
             });
         self.label_style_dialog_open = open;
     }
 
+    /// Rasterize the export and put it on the system clipboard, reporting the outcome.
     fn copy_image(&mut self, ctx: &egui::Context) {
         let result = (|| -> Result<(), String> {
-            let image = exporter::image(
-                ctx,
-                &self.elements,
-                &self.labels,
-                &self.node_labels,
-                &self.terminal_labels,
-                self.label_style,
-            )?;
+            let image = exporter::image(ctx, &self.doc)?;
             // Keep the clipboard owner alive so Linux applications can request the image.
             if self.clipboard.is_none() {
                 self.clipboard = Some(
@@ -879,25 +998,39 @@ impl Canvas {
             return;
         };
         let mut open = true;
-        egui::Window::new("Node expression").open(&mut open).default_width(560.0).show(ctx, |ui| {
-            let SolveState::Done(result) = state else {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Solving…");
-                });
-                return;
-            };
-            match result {
-                Ok(expression) => {
-                    ui.label("Expression for the network as it was when Solve was clicked:");
-                    let mut text = expression.clone();
-                    ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(5));
-                    if ui.button("Copy expression").clicked() { ctx.copy_text(expression.clone()); }
-                    ui.label("Assumes positive, finite conductances. Flow arrows inject positive flow. Terminal labels are known pressures; other labels are literal symbols.");
+        egui::Window::new("Node expression")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let SolveState::Done(result) = state else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Solving…");
+                    });
+                    return;
+                };
+                match result {
+                    Ok(expression) => {
+                        ui.label("Expression for the network as it was when Solve was clicked:");
+                        // Show in a read-only-in-effect text box so the user can select parts;
+                        // edits go to a throwaway copy.
+                        let mut text = expression.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(5),
+                        );
+                        if ui.button("Copy expression").clicked() {
+                            ctx.copy_text(expression.clone());
+                        }
+                        ui.label(SOLVE_ASSUMPTIONS);
+                    }
+                    Err(message) => {
+                        ui.label(message);
+                    }
                 }
-                Err(message) => { ui.label(message); }
-            }
-        });
+            });
         if !open {
             self.solve = None;
         }
@@ -919,6 +1052,7 @@ impl Canvas {
         self.solve = Some(SolveState::Running(receiver));
     }
 
+    /// Toolbar row. Buttons that act on the selection are disabled until it is large enough.
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if Self::tool_button(ui, self.grid_enabled, ToolIcon::Grid, "Grid: show and snap")
@@ -977,27 +1111,19 @@ impl Canvas {
             ui.separator();
             self.select_mode(ui, DrawMode::Erase, ToolIcon::Erase, "Erase");
             // Unlike drawing modes, this performs its action immediately.
+            // It keeps the typography and can be undone, unlike File > New.
             if Self::tool_button(ui, false, ToolIcon::CleanAll, "Clean all").clicked() {
-                self.elements.clear();
-                self.labels.clear();
-                self.node_labels.clear();
-                self.terminal_labels.clear();
-                self.start = None;
-                self.dragged_endpoints.clear();
-                self.dragged_endpoint_origins.clear();
-                self.drag_origin = None;
-                self.selected_endpoints.clear();
-                self.selection_start = None;
-                self.selection_pointer_down = false;
-                self.selection_drag_anchor = None;
-                self.editing_label = None;
+                self.apply_drawing(Drawing {
+                    label_style: self.doc.label_style,
+                    ..Drawing::empty()
+                });
             }
             ui.separator();
             if Self::tool_button(ui, false, ToolIcon::Typography, "Label typography").clicked() {
                 self.label_style_dialog_open = true;
             }
             ui.separator();
-            ui.add_enabled_ui(!self.elements.is_empty(), |ui| {
+            ui.add_enabled_ui(!self.doc.elements.is_empty(), |ui| {
                 if Self::tool_button(ui, false, ToolIcon::Camera, "Copy image")
                     .on_hover_text(
                         "Copy a tightly cropped diagram without grid or selection handles",
@@ -1013,12 +1139,14 @@ impl Canvas {
         }
     }
 
+    /// Toolbar button that switches the active tool.
     fn select_mode(&mut self, ui: &mut egui::Ui, mode: DrawMode, icon: ToolIcon, label: &str) {
         if Self::tool_button(ui, self.draw_mode == mode, icon, label).clicked() {
             self.draw_mode = mode;
         }
     }
 
+    /// Square icon button with an accessible name and hover text.
     fn tool_button(
         ui: &mut egui::Ui,
         selected: bool,
@@ -1058,6 +1186,7 @@ impl Canvas {
         response.on_hover_text(label)
     }
 
+    /// Hand-drawn vector icons, sized for a `TOOL_BUTTON_SIZE` button shrunk by 7 px.
     fn paint_tool_icon(
         painter: &egui::Painter,
         rect: egui::Rect,
@@ -1288,15 +1417,14 @@ impl Canvas {
         }
         // Treat coincident handles as one junction, including attached unselected handles.
         let mut positions = Vec::new();
-        for endpoint in &self.selected_endpoints {
-            let (start, end) = self.elements[endpoint.element_index].endpoints();
-            let position = if endpoint.is_start { start } else { end };
+        for position in self.endpoint_positions(&self.selected_endpoints) {
             if !positions.contains(&position) {
                 positions.push(position);
             }
         }
+        // Elements with both ends selected become length constraints between junctions.
         let mut edges = Vec::new();
-        for element in &self.elements {
+        for element in &self.doc.elements {
             let (start, end) = element.endpoints();
             if let (Some(a), Some(b)) = (
                 positions.iter().position(|p| *p == start),
@@ -1318,7 +1446,7 @@ impl Canvas {
                 *position = self.snap_position(*position, &[]);
             }
         }
-        for element in &mut self.elements {
+        for element in &mut self.doc.elements {
             let (start, end) = element.endpoints();
             for (is_start, position) in [(true, start), (false, end)] {
                 if let Some(index) = positions.iter().position(|p| *p == position) {
@@ -1334,14 +1462,8 @@ impl Canvas {
         if self.selected_endpoints.len() < 2 {
             return;
         }
-        let previous_positions: Vec<_> = self
-            .selected_endpoints
-            .iter()
-            .map(|endpoint| {
-                let (start, end) = self.elements[endpoint.element_index].endpoints();
-                if endpoint.is_start { start } else { end }
-            })
-            .collect();
+        let previous_positions = self.endpoint_positions(&self.selected_endpoints);
+        // Align on the centre of the selection's bounding box.
         let center = egui::Rect::from_points(&previous_positions).center();
         let new_positions: Vec<_> = previous_positions
             .iter()
@@ -1359,17 +1481,27 @@ impl Canvas {
             })
             .collect();
         for (endpoint, position) in self.selected_endpoints.iter().zip(&new_positions) {
-            self.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
+            self.doc.elements[endpoint.element_index].move_endpoint(endpoint.is_start, *position);
         }
         self.update_endpoint_labels(&previous_positions, &new_positions);
     }
 
+    /// Current positions of the given endpoints, in the same order.
+    fn endpoint_positions(&self, endpoints: &[DraggedEndpoint]) -> Vec<egui::Pos2> {
+        endpoints
+            .iter()
+            .map(|endpoint| self.doc.elements[endpoint.element_index].endpoint(endpoint.is_start))
+            .collect()
+    }
+
+    /// Carry position labels from `previous_positions[i]` to `new_positions[i]`, then drop
+    /// labels left without a junction or free terminal to attach to.
     fn update_endpoint_labels(
         &mut self,
         previous_positions: &[egui::Pos2],
         new_positions: &[egui::Pos2],
     ) {
-        for labels in [&mut self.node_labels, &mut self.terminal_labels] {
+        for labels in [&mut self.doc.node_labels, &mut self.doc.terminal_labels] {
             for label in labels {
                 if let Some(index) = previous_positions
                     .iter()
@@ -1379,14 +1511,35 @@ impl Canvas {
                 }
             }
         }
-        let junctions = junction_positions(&self.elements);
-        self.node_labels
-            .retain(|label| junctions.contains(&label.position));
-        let terminals = unconnected_resistor_terminal_positions(&self.elements);
-        self.terminal_labels
-            .retain(|label| terminals.contains(&label.position));
+        self.prune_position_labels();
     }
 
+    /// Node labels survive only on junctions and terminal labels only on free terminals,
+    /// mirroring where the label tool lets them be created.
+    /// Closes an open node/terminal label editor if any label was removed, because its
+    /// index may now refer to a different label.
+    fn prune_position_labels(&mut self) {
+        let counts = (self.doc.node_labels.len(), self.doc.terminal_labels.len());
+        let junctions = junction_positions(&self.doc.elements);
+        self.doc
+            .node_labels
+            .retain(|label| junctions.contains(&label.position));
+        let terminals = unconnected_resistor_terminal_positions(&self.doc.elements);
+        self.doc
+            .terminal_labels
+            .retain(|label| terminals.contains(&label.position));
+        if counts != (self.doc.node_labels.len(), self.doc.terminal_labels.len())
+            && matches!(
+                self.editing_label,
+                Some(EditingLabel::Node(_) | EditingLabel::Terminal(_))
+            )
+        {
+            self.editing_label = None;
+        }
+    }
+
+    /// Select tool: click selects the endpoints at one position, a drag on empty space
+    /// selects by rectangle, and a press on a selected endpoint arms a move (`handle_drag`).
     fn handle_selection(
         &mut self,
         response: &egui::Response,
@@ -1402,7 +1555,7 @@ impl Canvas {
         if response.is_pointer_button_down_on() && !self.selection_pointer_down {
             self.selection_pointer_down = true;
             self.selection_drag_anchor = pointer_position
-                .and_then(|position| endpoint_at(&self.elements, position))
+                .and_then(|position| endpoint_at(&self.doc.elements, position))
                 .filter(|endpoint| self.selected_endpoints.contains(endpoint));
             if self.selection_drag_anchor.is_none() {
                 self.selection_start = pointer_position;
@@ -1413,13 +1566,13 @@ impl Canvas {
         if response.drag_stopped() {
             if let (Some(start), Some(end)) = (self.selection_start.take(), pointer_position) {
                 let selection = egui::Rect::from_two_pos(start, end);
-                self.selected_endpoints = endpoints_in_rect(&self.elements, selection);
+                self.selected_endpoints = endpoints_in_rect(&self.doc.elements, selection);
             }
         } else if response.clicked() {
             self.selection_start = None;
             self.selected_endpoints = pointer_position
-                .and_then(|position| endpoint_at(&self.elements, position))
-                .map(|endpoint| overlapping_endpoints(&self.elements, endpoint))
+                .and_then(|position| endpoint_at(&self.doc.elements, position))
+                .map(|endpoint| overlapping_endpoints(&self.doc.elements, endpoint))
                 .unwrap_or_default();
         }
         if !response.is_pointer_button_down_on() {
@@ -1428,6 +1581,7 @@ impl Canvas {
         }
     }
 
+    /// Delete/Backspace removes every element with a selected endpoint.
     fn handle_selected_delete(&mut self, ui: &egui::Ui) {
         if self.selected_endpoints.is_empty()
             || self.editing_label.is_some()
@@ -1443,29 +1597,29 @@ impl Canvas {
     }
 
     fn delete_selected_elements(&mut self) {
-        let mut indices: Vec<_> = self
+        let indices: Vec<_> = self
             .selected_endpoints
             .iter()
             .map(|endpoint| endpoint.element_index)
             .collect();
+        self.remove_elements(indices);
+    }
+
+    /// The single place elements are removed. Keeps `labels[i]` paired with `elements[i]`,
+    /// drops orphaned position labels, and clears interaction state because every stored
+    /// element or label index may now refer to something else.
+    fn remove_elements(&mut self, mut indices: Vec<usize>) {
         indices.sort_unstable();
         indices.dedup();
         for index in indices.into_iter().rev() {
-            self.elements.remove(index);
-            self.labels.remove(index);
+            self.doc.elements.remove(index);
+            self.doc.labels.remove(index);
         }
-        self.selected_endpoints.clear();
-        self.dragged_endpoints.clear();
-        self.dragged_endpoint_origins.clear();
-        self.drag_origin = None;
-        let junctions = junction_positions(&self.elements);
-        self.node_labels
-            .retain(|label| junctions.contains(&label.position));
-        let terminals = unconnected_resistor_terminal_positions(&self.elements);
-        self.terminal_labels
-            .retain(|label| terminals.contains(&label.position));
+        self.prune_position_labels();
+        self.clear_interaction_state();
     }
 
+    /// Highlight selected endpoints and the rubber-band rectangle being dragged.
     fn draw_selection(
         &self,
         painter: &egui::Painter,
@@ -1474,7 +1628,7 @@ impl Canvas {
     ) {
         let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 110, 220));
         for endpoint in &self.selected_endpoints {
-            let Some(element) = self.elements.get(endpoint.element_index) else {
+            let Some(element) = self.doc.elements.get(endpoint.element_index) else {
                 continue;
             };
             let (start, end) = element.endpoints();
@@ -1493,45 +1647,30 @@ impl Canvas {
         }
     }
 
+    /// Erase tool: a click removes the topmost element under the pointer, or the whole
+    /// selection if that element is part of it.
     fn handle_erase(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
-        // In erase mode, remove the topmost element under a canvas click.
-        if self.draw_mode == DrawMode::Erase && response.clicked() {
-            if let Some(position) = pointer_position {
-                if let Some(element_index) = element_at(&self.elements, position) {
-                    if self
-                        .selected_endpoints
-                        .iter()
-                        .any(|endpoint| endpoint.element_index == element_index)
-                    {
-                        self.delete_selected_elements();
-                        return;
-                    }
-                    self.selected_endpoints.clear();
-                    self.elements.remove(element_index);
-                    self.labels.remove(element_index);
-                    self.editing_label =
-                        self.editing_label
-                            .and_then(|editing_index| match editing_index {
-                                EditingLabel::Element(index) if index == element_index => None,
-                                EditingLabel::Element(index) => Some(EditingLabel::Element(
-                                    index - usize::from(index > element_index),
-                                )),
-                                EditingLabel::Node(index) => Some(EditingLabel::Node(index)),
-                                EditingLabel::Terminal(index) => {
-                                    Some(EditingLabel::Terminal(index))
-                                }
-                            });
-                    let positions = junction_positions(&self.elements);
-                    self.node_labels
-                        .retain(|label| positions.contains(&label.position));
-                    let terminals = unconnected_resistor_terminal_positions(&self.elements);
-                    self.terminal_labels
-                        .retain(|label| terminals.contains(&label.position));
-                }
-            }
+        if self.draw_mode != DrawMode::Erase || !response.clicked() {
+            return;
+        }
+        let Some(element_index) =
+            pointer_position.and_then(|position| element_at(&self.doc.elements, position))
+        else {
+            return;
+        };
+        if self
+            .selected_endpoints
+            .iter()
+            .any(|endpoint| endpoint.element_index == element_index)
+        {
+            self.delete_selected_elements();
+        } else {
+            self.remove_elements(vec![element_index]);
         }
     }
 
+    /// Label tool: a click opens the editor for the junction, free terminal, or element
+    /// under the pointer, in that priority, creating an empty position label if needed.
     fn handle_label_click(
         &mut self,
         response: &egui::Response,
@@ -1539,65 +1678,65 @@ impl Canvas {
     ) {
         if self.draw_mode == DrawMode::Label && response.clicked() {
             self.editing_label = pointer_position.and_then(|position| {
-                let junctions = junction_positions(&self.elements);
-                let terminals = unconnected_resistor_terminal_positions(&self.elements);
+                let junctions = junction_positions(&self.doc.elements);
+                let terminals = unconnected_resistor_terminal_positions(&self.doc.elements);
                 junctions
                     .iter()
-                    .position(|node| node.distance(position) <= 10.0)
+                    .position(|node| node.distance(position) <= ELEMENT_HIT_DISTANCE)
                     .map(|index| {
                         let node_position = junctions[index];
                         let label_index = self
+                            .doc
                             .node_labels
                             .iter()
                             .position(|label| label.position == node_position)
                             .unwrap_or_else(|| {
-                                self.node_labels.push(crate::label::NodeLabel {
+                                self.doc.node_labels.push(NodeLabel {
                                     position: node_position,
                                     text: String::new(),
                                 });
-                                self.node_labels.len() - 1
+                                self.doc.node_labels.len() - 1
                             });
                         EditingLabel::Node(label_index)
                     })
                     .or_else(|| {
                         terminals
                             .iter()
-                            .position(|terminal| terminal.distance(position) <= 10.0)
+                            .position(|terminal| {
+                                terminal.distance(position) <= ELEMENT_HIT_DISTANCE
+                            })
                             .map(|index| {
                                 let terminal_position = terminals[index];
                                 let label_index = self
+                                    .doc
                                     .terminal_labels
                                     .iter()
                                     .position(|label| label.position == terminal_position)
                                     .unwrap_or_else(|| {
-                                        self.terminal_labels.push(crate::label::NodeLabel {
+                                        self.doc.terminal_labels.push(NodeLabel {
                                             position: terminal_position,
                                             text: String::new(),
                                         });
-                                        self.terminal_labels.len() - 1
+                                        self.doc.terminal_labels.len() - 1
                                     });
                                 EditingLabel::Terminal(label_index)
                             })
                     })
-                    .or_else(|| element_at(&self.elements, position).map(EditingLabel::Element))
+                    .or_else(|| element_at(&self.doc.elements, position).map(EditingLabel::Element))
             });
         }
     }
 
-    fn show_label_editor(
-        &mut self,
-        ui: &egui::Ui,
-        placements: &[Option<crate::label::Placement>],
-        node_placements: &[Option<crate::label::Placement>],
-        terminal_placements: &[Option<crate::label::Placement>],
-    ) {
+    /// Inline text editor over the label being edited (screen-space `layout`), with
+    /// buttons that insert script markers. Enter closes it.
+    fn show_label_editor(&mut self, ui: &egui::Ui, layout: &LabelLayout) {
         let Some(editing) = self.editing_label else {
             return;
         };
         let (index, placement) = match editing {
-            EditingLabel::Element(index) => (index, placements.get(index)),
-            EditingLabel::Node(index) => (index, node_placements.get(index)),
-            EditingLabel::Terminal(index) => (index, terminal_placements.get(index)),
+            EditingLabel::Element(index) => (index, layout.elements.get(index)),
+            EditingLabel::Node(index) => (index, layout.nodes.get(index)),
+            EditingLabel::Terminal(index) => (index, layout.terminals.get(index)),
         };
         let Some(Some(placement)) = placement else {
             self.editing_label = None;
@@ -1610,16 +1749,16 @@ impl Canvas {
             .fixed_pos(placement.rect.left_top())
             .show(ui.ctx(), |ui| {
                 let label = match editing {
-                    EditingLabel::Element(_) => &mut self.labels[index],
-                    EditingLabel::Node(_) => &mut self.node_labels[index].text,
-                    EditingLabel::Terminal(_) => &mut self.terminal_labels[index].text,
+                    EditingLabel::Element(_) => &mut self.doc.labels[index],
+                    EditingLabel::Node(_) => &mut self.doc.node_labels[index].text,
+                    EditingLabel::Terminal(_) => &mut self.doc.terminal_labels[index].text,
                 };
                 let response = ui
                     .horizontal(|ui| {
                         let response = ui.add_sized(
                             placement.rect.size(),
                             egui::TextEdit::singleline(&mut *label)
-                                .font(self.label_style.font_id())
+                                .font(self.doc.label_style.font_id())
                                 .text_color(egui::Color32::BLACK)
                                 .background_color(CANVAS_BACKGROUND),
                         );
@@ -1655,6 +1794,8 @@ impl Canvas {
         }
     }
 
+    /// Start new elements on press, arm endpoint moves on drag start, and move dragged
+    /// endpoints every frame, snapping only the anchor and shifting the rest rigidly.
     fn handle_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         // This must use the press state rather than `drag_started()`: because the canvas also
         // accepts clicks, egui delays `drag_started()` until the pointer moves past the click
@@ -1682,25 +1823,8 @@ impl Canvas {
             if let Some(position) = pointer_position {
                 match self.draw_mode {
                     DrawMode::Select => {
-                        if let Some(endpoint) = self.selection_drag_anchor {
-                            self.dragged_endpoints = self.selected_endpoints.clone();
-                            if let Some(anchor_index) = self
-                                .dragged_endpoints
-                                .iter()
-                                .position(|selected| *selected == endpoint)
-                            {
-                                self.dragged_endpoints.swap(0, anchor_index);
-                            }
-                            self.dragged_endpoint_origins = self
-                                .dragged_endpoints
-                                .iter()
-                                .map(|endpoint| {
-                                    let (start, end) =
-                                        self.elements[endpoint.element_index].endpoints();
-                                    if endpoint.is_start { start } else { end }
-                                })
-                                .collect();
-                            self.drag_origin = Some(position);
+                        if let Some(anchor) = self.selection_drag_anchor {
+                            self.begin_endpoint_drag(anchor, position);
                         }
                     }
                     DrawMode::Resistor
@@ -1715,8 +1839,9 @@ impl Canvas {
             && !self.dragged_endpoints.is_empty()
         {
             // Update on every frame while the pointer is held down for smooth motion.
+            // Snap to endpoints only if every dragged handle can connect (not arrow tails).
             let can_snap = self.dragged_endpoints.iter().all(|endpoint| {
-                self.elements[endpoint.element_index].endpoint_can_snap(endpoint.is_start)
+                self.doc.elements[endpoint.element_index].endpoint_can_snap(endpoint.is_start)
             });
             let pointer_delta = position - self.drag_origin.unwrap_or(position);
             let anchor_origin = self
@@ -1728,28 +1853,80 @@ impl Canvas {
             let target_anchor = (self.grid_enabled || can_snap)
                 .then(|| self.snap_position(unsnapped_anchor, &self.dragged_endpoints))
                 .unwrap_or(unsnapped_anchor);
-            let delta = target_anchor - anchor_origin;
-            let previous_positions: Vec<_> = self
-                .dragged_endpoints
-                .iter()
-                .map(|endpoint| {
-                    let (start, end) = self.elements[endpoint.element_index].endpoints();
-                    if endpoint.is_start { start } else { end }
-                })
-                .collect();
-            let new_positions: Vec<_> = self
-                .dragged_endpoint_origins
-                .iter()
-                .map(|position| *position + delta)
-                .collect();
-            for (endpoint, new_position) in self.dragged_endpoints.iter().zip(&new_positions) {
-                self.elements[endpoint.element_index]
-                    .move_endpoint(endpoint.is_start, *new_position);
-            }
-            self.update_endpoint_labels(&previous_positions, &new_positions);
+            self.move_dragged_endpoints(target_anchor - anchor_origin);
         }
     }
 
+    /// Start moving the whole selection, with `anchor` as the endpoint that snaps.
+    fn begin_endpoint_drag(&mut self, anchor: DraggedEndpoint, pointer: egui::Pos2) {
+        self.dragged_endpoints = self.selected_endpoints.clone();
+        if let Some(anchor_index) = self
+            .dragged_endpoints
+            .iter()
+            .position(|selected| *selected == anchor)
+        {
+            self.dragged_endpoints.swap(0, anchor_index);
+        }
+        self.dragged_endpoint_origins = self.endpoint_positions(&self.dragged_endpoints);
+        self.drag_origin = Some(pointer);
+        self.dragged_labels = self.labels_at(&self.dragged_endpoint_origins);
+    }
+
+    /// Place every dragged endpoint, and its attached labels, at its origin plus `delta`.
+    fn move_dragged_endpoints(&mut self, delta: egui::Vec2) {
+        let new_positions: Vec<_> = self
+            .dragged_endpoint_origins
+            .iter()
+            .map(|position| *position + delta)
+            .collect();
+        for (endpoint, new_position) in self.dragged_endpoints.iter().zip(&new_positions) {
+            self.doc.elements[endpoint.element_index]
+                .move_endpoint(endpoint.is_start, *new_position);
+        }
+        // Labels are pruned once, on release (`end_endpoint_drag`); the topology is only
+        // provisional while the pointer is down.
+        for label in &self.dragged_labels {
+            let labels = if label.is_terminal {
+                &mut self.doc.terminal_labels
+            } else {
+                &mut self.doc.node_labels
+            };
+            labels[label.label_index].position = new_positions[label.endpoint_index];
+        }
+    }
+
+    /// Position labels located at any of `positions`, with the index of that position.
+    fn labels_at(&self, positions: &[egui::Pos2]) -> Vec<DraggedLabel> {
+        let attached = |is_terminal: bool, labels: &[NodeLabel]| {
+            labels
+                .iter()
+                .enumerate()
+                .filter_map(|(label_index, label)| {
+                    let endpoint_index = positions.iter().position(|p| *p == label.position)?;
+                    Some(DraggedLabel {
+                        is_terminal,
+                        label_index,
+                        endpoint_index,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut dragged = attached(false, &self.doc.node_labels);
+        dragged.extend(attached(true, &self.doc.terminal_labels));
+        dragged
+    }
+
+    /// Finish an endpoint move. Only the final topology decides which labels still have a
+    /// junction or free terminal to attach to.
+    fn end_endpoint_drag(&mut self) {
+        self.dragged_endpoints.clear();
+        self.dragged_endpoint_origins.clear();
+        self.drag_origin = None;
+        self.dragged_labels.clear();
+        self.prune_position_labels();
+    }
+
+    /// Rubber-band preview of the element being drawn, ending at the snapped pointer.
     fn draw_preview(
         &self,
         painter: &egui::Painter,
@@ -1771,6 +1948,7 @@ impl Canvas {
         }
     }
 
+    /// On release: end an endpoint move, or create the element being drawn.
     fn finish_drag(&mut self, response: &egui::Response, pointer_position: Option<egui::Pos2>) {
         if !response.drag_stopped() {
             // A click is not considered a drag by egui. Discard its provisional drawing start;
@@ -1781,25 +1959,26 @@ impl Canvas {
             return;
         }
 
-        if !std::mem::take(&mut self.dragged_endpoints).is_empty() {
-            self.dragged_endpoint_origins.clear();
-            self.drag_origin = None;
+        if !self.dragged_endpoints.is_empty() {
+            self.end_endpoint_drag();
             // Moving an endpoint never creates an additional element on release.
             return;
         }
 
         if let (Some(start), Some(position)) = (self.start, pointer_position) {
             let end = self.snap_position(position, &[]);
-            match self.draw_mode {
-                DrawMode::Resistor => self.elements.push(Element::Resistor(start, end)),
-                DrawMode::PrescribedFlow => self.elements.push(Element::PrescribedFlow(start, end)),
-                DrawMode::Select | DrawMode::Label | DrawMode::Erase => {}
-            }
-            if matches!(
-                self.draw_mode,
-                DrawMode::Resistor | DrawMode::PrescribedFlow
-            ) {
-                self.labels.push(String::new());
+            let element = match self.draw_mode {
+                DrawMode::Resistor => Some(Element::Resistor(start, end)),
+                DrawMode::PrescribedFlow => Some(Element::PrescribedFlow(start, end)),
+                DrawMode::Select | DrawMode::Label | DrawMode::Erase => None,
+            };
+            // A drag that ends (after snapping) almost where it began would create an
+            // invisible element that still joins the network; discard it instead.
+            if let Some(element) = element
+                && start.distance(end) >= MIN_ELEMENT_LENGTH
+            {
+                self.doc.elements.push(element);
+                self.doc.labels.push(String::new());
             }
         }
 
@@ -1807,8 +1986,10 @@ impl Canvas {
     }
 }
 
-// Fit equal-length vectors in the original directions first, then relax the length
-// constraints. Trees can retain their angles exactly; loops may need to change them.
+/// Move `positions` so every edge approaches the mean edge length. Phase 1 fits
+/// equal-length vectors in the original directions (a least-squares relaxation); phase 2
+/// relaxes the length constraints alone. Trees can retain their angles exactly; loops
+/// may need to change them.
 fn equal_length_positions(positions: &[egui::Pos2], edges: &[(usize, usize)]) -> Vec<egui::Pos2> {
     let mut result = positions.to_vec();
     if edges.is_empty() {
@@ -1828,6 +2009,7 @@ fn equal_length_positions(positions: &[egui::Pos2], edges: &[(usize, usize)]) ->
         degrees[a] += 1.0;
         degrees[b] += 1.0;
     }
+    // Scaling the step by the highest node degree keeps the Jacobi-style update stable.
     let step = 0.45 / degrees.into_iter().fold(1.0_f32, f32::max);
     for _ in 0..1000 {
         let mut corrections = vec![egui::Vec2::ZERO; positions.len()];
@@ -1870,6 +2052,7 @@ fn equal_length_positions(positions: &[egui::Pos2], edges: &[(usize, usize)]) ->
     result
 }
 
+/// Outline `rect` with 6 px dashes and 4 px gaps.
 fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
     for (start, end) in [
         (rect.left_top(), rect.right_top()),
@@ -1916,6 +2099,7 @@ fn insert_label_marker(ctx: &egui::Context, id: egui::Id, label: &mut String, ma
     egui::TextEdit::store_state(ctx, id, state);
 }
 
+/// Byte offset of the `char_index`-th character, or the end of `text` if past it.
 fn byte_index_at_char(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
@@ -1929,7 +2113,7 @@ mod tests {
     #[test]
     fn grid_snaps_to_intersections_and_restores_endpoint_snapping_when_disabled() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(13.0, 17.0),
             egui::pos2(103.0, 107.0),
         ));
@@ -1948,12 +2132,12 @@ mod tests {
     #[test]
     fn snap_selected_to_grid_works_with_grid_hidden_and_supports_undo() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(13.0, 23.0),
             egui::pos2(87.0, 92.0),
         ));
-        canvas.labels.push(String::new());
-        canvas.terminal_labels.push(crate::label::NodeLabel {
+        canvas.doc.labels.push(String::new());
+        canvas.doc.terminal_labels.push(crate::label::NodeLabel {
             position: egui::pos2(13.0, 23.0),
             text: "A".into(),
         });
@@ -1965,10 +2149,13 @@ mod tests {
         let before = canvas.drawing();
         canvas.snap_selected_to_grid();
         assert_eq!(
-            canvas.elements[0].endpoints(),
+            canvas.doc.elements[0].endpoints(),
             (egui::pos2(20.0, 20.0), egui::pos2(87.0, 92.0))
         );
-        assert_eq!(canvas.terminal_labels[0].position, egui::pos2(20.0, 20.0));
+        assert_eq!(
+            canvas.doc.terminal_labels[0].position,
+            egui::pos2(20.0, 20.0)
+        );
         assert!(!canvas.grid_enabled);
         assert_eq!(canvas.selected_endpoints.len(), 1);
         let after = canvas.drawing();
@@ -1981,22 +2168,13 @@ mod tests {
     #[test]
     fn grid_toggle_does_not_change_document_or_svg() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(20.0, 20.0),
             egui::pos2(100.0, 80.0),
         ));
-        canvas.labels.push(String::new());
+        canvas.doc.labels.push(String::new());
         let ctx = egui::Context::default();
-        let export = |canvas: &Canvas| {
-            exporter::svg(
-                &ctx,
-                &canvas.elements,
-                &canvas.labels,
-                &canvas.node_labels,
-                &canvas.terminal_labels,
-                canvas.label_style,
-            )
-        };
+        let export = |canvas: &Canvas| exporter::svg(&ctx, &canvas.doc);
         let drawing = canvas.drawing();
         let svg = export(&canvas);
         canvas.grid_enabled = true;
@@ -2008,12 +2186,12 @@ mod tests {
     fn undo_redo_restores_drawing_and_saved_state() {
         let mut canvas = Canvas::default();
         let empty = canvas.drawing();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(0.0, 0.0),
             egui::pos2(50.0, 0.0),
         ));
-        canvas.labels.push("R_1".into());
-        canvas.label_style.font = crate::label::LabelFont::SourceSerif4;
+        canvas.doc.labels.push("R_1".into());
+        canvas.doc.label_style.font = crate::label::LabelFont::SourceSerif4;
         let edited = canvas.drawing();
         canvas.clean_drawing = edited.clone();
         canvas.undo(); // Includes changes that have not yet been committed at frame end.
@@ -2023,7 +2201,7 @@ mod tests {
         assert_eq!(canvas.drawing(), edited);
         assert!(!canvas.is_dirty());
         canvas.undo();
-        canvas.label_style.size = 30.0;
+        canvas.doc.label_style.size = 30.0;
         canvas.record_edit();
         assert!(canvas.redo_stack.is_empty());
     }
@@ -2031,7 +2209,7 @@ mod tests {
     #[test]
     fn new_drawing_resets_history() {
         let mut canvas = Canvas::default();
-        canvas.label_style.size = 30.0;
+        canvas.doc.label_style.size = 30.0;
         canvas.record_edit();
         canvas.undo();
         canvas.new_drawing();
@@ -2045,7 +2223,7 @@ mod tests {
     fn control_z_and_y_restore_drawing() {
         let ctx = egui::Context::default();
         let mut canvas = Canvas::default();
-        canvas.label_style.size = 30.0;
+        canvas.doc.label_style.size = 30.0;
         canvas.record_edit();
         for (key, expected_size) in [(egui::Key::Z, 22.0), (egui::Key::Y, 30.0)] {
             let mut input = egui::RawInput::default();
@@ -2058,7 +2236,7 @@ mod tests {
             });
             let mut output = ctx.run_ui(input, |ui| canvas.handle_edit_shortcuts(ui.ctx()));
             output.textures_delta.clear();
-            assert_eq!(canvas.label_style.size, expected_size);
+            assert_eq!(canvas.doc.label_style.size, expected_size);
         }
     }
 
@@ -2109,12 +2287,12 @@ mod tests {
     #[test]
     fn equal_lengths_keeps_junctions_labels_and_undo() {
         let mut canvas = Canvas::default();
-        canvas.elements = vec![
+        canvas.doc.elements = vec![
             Element::Resistor(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0)),
             Element::Resistor(egui::pos2(100.0, 0.0), egui::pos2(100.0, 200.0)),
             Element::Resistor(egui::pos2(100.0, 0.0), egui::pos2(300.0, 300.0)),
         ];
-        canvas.labels = vec![String::new(); 3];
+        canvas.doc.labels = vec![String::new(); 3];
         canvas.selected_endpoints = vec![
             DraggedEndpoint {
                 element_index: 0,
@@ -2129,7 +2307,7 @@ mod tests {
                 is_start: false,
             },
         ];
-        canvas.node_labels.push(crate::label::NodeLabel {
+        canvas.doc.node_labels.push(crate::label::NodeLabel {
             position: egui::pos2(100.0, 0.0),
             text: "A".into(),
         });
@@ -2138,18 +2316,21 @@ mod tests {
         canvas.equalize_selected_lengths();
         let after = canvas.drawing();
         assert_eq!(
-            canvas.elements[0].endpoints().1,
-            canvas.elements[1].endpoints().0
+            canvas.doc.elements[0].endpoints().1,
+            canvas.doc.elements[1].endpoints().0
         );
         assert_eq!(
-            canvas.elements[0].endpoints().1,
-            canvas.elements[2].endpoints().0
+            canvas.doc.elements[0].endpoints().1,
+            canvas.doc.elements[2].endpoints().0
         );
         assert_eq!(
-            canvas.node_labels[0].position,
-            canvas.elements[0].endpoints().1
+            canvas.doc.node_labels[0].position,
+            canvas.doc.elements[0].endpoints().1
         );
-        assert_eq!(canvas.elements[2].endpoints().1, egui::pos2(300.0, 300.0));
+        assert_eq!(
+            canvas.doc.elements[2].endpoints().1,
+            egui::pos2(300.0, 300.0)
+        );
         canvas.undo();
         assert_eq!(canvas.drawing(), before);
         canvas.redo();
@@ -2160,12 +2341,12 @@ mod tests {
     fn equal_lengths_snaps_to_grid_and_keeps_junctions_labels_and_undo() {
         let mut canvas = Canvas::default();
         canvas.grid_enabled = true;
-        canvas.elements = vec![
+        canvas.doc.elements = vec![
             Element::Resistor(egui::pos2(13.0, 23.0), egui::pos2(103.0, 23.0)),
             Element::Resistor(egui::pos2(103.0, 23.0), egui::pos2(103.0, 213.0)),
             Element::Resistor(egui::pos2(103.0, 23.0), egui::pos2(303.0, 313.0)),
         ];
-        canvas.labels = vec![String::new(); 3];
+        canvas.doc.labels = vec![String::new(); 3];
         canvas.selected_endpoints = vec![
             DraggedEndpoint {
                 element_index: 0,
@@ -2180,7 +2361,7 @@ mod tests {
                 is_start: false,
             },
         ];
-        canvas.node_labels.push(crate::label::NodeLabel {
+        canvas.doc.node_labels.push(crate::label::NodeLabel {
             position: egui::pos2(103.0, 23.0),
             text: "A".into(),
         });
@@ -2188,16 +2369,19 @@ mod tests {
         let before = canvas.drawing();
         canvas.equalize_selected_lengths();
         for endpoint in &canvas.selected_endpoints {
-            let (start, end) = canvas.elements[endpoint.element_index].endpoints();
+            let (start, end) = canvas.doc.elements[endpoint.element_index].endpoints();
             let position = if endpoint.is_start { start } else { end };
             assert_eq!(position.x % GRID_SPACING, 0.0);
             assert_eq!(position.y % GRID_SPACING, 0.0);
         }
-        let junction = canvas.elements[0].endpoints().1;
-        assert_eq!(canvas.elements[1].endpoints().0, junction);
-        assert_eq!(canvas.elements[2].endpoints().0, junction);
-        assert_eq!(canvas.node_labels[0].position, junction);
-        assert_eq!(canvas.elements[2].endpoints().1, egui::pos2(303.0, 313.0));
+        let junction = canvas.doc.elements[0].endpoints().1;
+        assert_eq!(canvas.doc.elements[1].endpoints().0, junction);
+        assert_eq!(canvas.doc.elements[2].endpoints().0, junction);
+        assert_eq!(canvas.doc.node_labels[0].position, junction);
+        assert_eq!(
+            canvas.doc.elements[2].endpoints().1,
+            egui::pos2(303.0, 313.0)
+        );
         let after = canvas.drawing();
         canvas.undo();
         assert_eq!(canvas.drawing(), before);
@@ -2209,7 +2393,7 @@ mod tests {
     fn alignment_moves_only_selected_coordinates_and_attached_labels() {
         for horizontal in [true, false] {
             let mut canvas = Canvas::default();
-            canvas.elements = vec![
+            canvas.doc.elements = vec![
                 Element::Resistor(egui::pos2(10.0, 20.0), egui::pos2(100.0, 100.0)),
                 Element::PrescribedFlow(egui::pos2(200.0, 200.0), egui::pos2(50.0, 80.0)),
             ];
@@ -2223,11 +2407,11 @@ mod tests {
                     is_start: false,
                 },
             ];
-            canvas.terminal_labels.push(crate::label::NodeLabel {
+            canvas.doc.terminal_labels.push(crate::label::NodeLabel {
                 position: egui::pos2(10.0, 20.0),
                 text: "terminal".into(),
             });
-            canvas.node_labels.push(crate::label::NodeLabel {
+            canvas.doc.node_labels.push(crate::label::NodeLabel {
                 position: egui::pos2(50.0, 80.0),
                 text: "node".into(),
             });
@@ -2239,15 +2423,15 @@ mod tests {
                 [egui::pos2(30.0, 20.0), egui::pos2(30.0, 80.0)]
             };
             assert_eq!(
-                canvas.elements[0].endpoints(),
+                canvas.doc.elements[0].endpoints(),
                 (expected[0], egui::pos2(100.0, 100.0))
             );
             assert_eq!(
-                canvas.elements[1].endpoints(),
+                canvas.doc.elements[1].endpoints(),
                 (egui::pos2(200.0, 200.0), expected[1])
             );
-            assert_eq!(canvas.terminal_labels[0].position, expected[0]);
-            assert_eq!(canvas.node_labels[0].position, expected[1]);
+            assert_eq!(canvas.doc.terminal_labels[0].position, expected[0]);
+            assert_eq!(canvas.doc.node_labels[0].position, expected[1]);
             assert_eq!(canvas.selected_endpoints, selection);
         }
     }
@@ -2257,11 +2441,11 @@ mod tests {
         for horizontal in [true, false] {
             let mut canvas = Canvas::default();
             canvas.grid_enabled = true;
-            canvas.elements = vec![Element::Resistor(
+            canvas.doc.elements = vec![Element::Resistor(
                 egui::pos2(13.0, 23.0),
                 egui::pos2(87.0, 92.0),
             )];
-            canvas.labels.push(String::new());
+            canvas.doc.labels.push(String::new());
             canvas.selected_endpoints = vec![
                 DraggedEndpoint {
                     element_index: 0,
@@ -2272,7 +2456,7 @@ mod tests {
                     is_start: false,
                 },
             ];
-            canvas.terminal_labels.push(crate::label::NodeLabel {
+            canvas.doc.terminal_labels.push(crate::label::NodeLabel {
                 position: egui::pos2(13.0, 23.0),
                 text: "terminal".into(),
             });
@@ -2284,8 +2468,8 @@ mod tests {
             } else {
                 (egui::pos2(60.0, 20.0), egui::pos2(60.0, 100.0))
             };
-            assert_eq!(canvas.elements[0].endpoints(), expected);
-            assert_eq!(canvas.terminal_labels[0].position, expected.0);
+            assert_eq!(canvas.doc.elements[0].endpoints(), expected);
+            assert_eq!(canvas.doc.terminal_labels[0].position, expected.0);
             let aligned = canvas.drawing();
             canvas.undo();
             assert_eq!(canvas.drawing(), before);
@@ -2297,17 +2481,17 @@ mod tests {
     #[test]
     fn solve_runs_in_background_on_a_snapshot() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(0.0, 0.0),
             egui::pos2(100.0, 0.0),
         ));
-        canvas.labels.push("G".into());
-        canvas.elements.push(Element::PrescribedFlow(
+        canvas.doc.labels.push("G".into());
+        canvas.doc.elements.push(Element::PrescribedFlow(
             egui::pos2(100.0, 50.0),
             egui::pos2(100.0, 0.0),
         ));
-        canvas.labels.push("Q".into());
-        canvas.terminal_labels.push(crate::label::NodeLabel {
+        canvas.doc.labels.push("Q".into());
+        canvas.doc.terminal_labels.push(crate::label::NodeLabel {
             position: egui::pos2(0.0, 0.0),
             text: "T_0".into(),
         });
@@ -2317,7 +2501,7 @@ mod tests {
         });
         canvas.start_solve(&egui::Context::default());
         // Edits after clicking Solve must not change the pending result.
-        canvas.labels[0] = "K".into();
+        canvas.doc.labels[0] = "K".into();
         let Some(SolveState::Running(receiver)) = &canvas.solve else {
             panic!("solve did not start in the background");
         };
@@ -2328,16 +2512,136 @@ mod tests {
     }
 
     #[test]
+    fn removing_elements_closes_label_editor_and_keeps_labels_paired() {
+        let mut canvas = Canvas::default();
+        for (index, x) in [0.0, 100.0, 200.0].into_iter().enumerate() {
+            canvas.doc.elements.push(Element::Resistor(
+                egui::pos2(x, 0.0),
+                egui::pos2(x + 100.0, 0.0),
+            ));
+            canvas.doc.labels.push(format!("G_{index}"));
+        }
+        // Editing the last element's label; deleting an earlier element shifts its index.
+        canvas.editing_label = Some(EditingLabel::Element(2));
+        canvas.selected_endpoints = vec![DraggedEndpoint {
+            element_index: 0,
+            is_start: true,
+        }];
+
+        canvas.delete_selected_elements();
+
+        assert_eq!(canvas.editing_label, None);
+        assert!(canvas.selected_endpoints.is_empty());
+        assert_eq!(canvas.doc.labels, ["G_1", "G_2"]);
+        assert_eq!(canvas.doc.elements[0].endpoints().0, egui::pos2(100.0, 0.0));
+    }
+
+    #[test]
+    fn dragging_over_another_endpoint_keeps_labels_until_release() {
+        let mut canvas = Canvas::default();
+        canvas.doc.elements = vec![
+            Element::Resistor(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0)),
+            Element::Resistor(egui::pos2(200.0, 0.0), egui::pos2(300.0, 0.0)),
+        ];
+        canvas.doc.labels = vec!["G_1".into(), "G_2".into()];
+        canvas.doc.terminal_labels = vec![
+            NodeLabel {
+                position: egui::pos2(100.0, 0.0),
+                text: "P_a".into(),
+            },
+            NodeLabel {
+                position: egui::pos2(200.0, 0.0),
+                text: "P_b".into(),
+            },
+        ];
+        let dragged = DraggedEndpoint {
+            element_index: 0,
+            is_start: false,
+        };
+        canvas.selected_endpoints = vec![dragged];
+        canvas.begin_endpoint_drag(dragged, egui::pos2(100.0, 0.0));
+
+        // Pass over the other terminal: briefly a junction, so neither is a free terminal.
+        canvas.move_dragged_endpoints(egui::vec2(100.0, 0.0));
+        assert_eq!(canvas.doc.terminal_labels.len(), 2);
+        // Continue past it. P_b must stay put rather than being carried along.
+        canvas.move_dragged_endpoints(egui::vec2(100.0, 50.0));
+        canvas.end_endpoint_drag();
+
+        assert_eq!(
+            canvas.doc.terminal_labels,
+            [
+                NodeLabel {
+                    position: egui::pos2(200.0, 50.0),
+                    text: "P_a".into(),
+                },
+                NodeLabel {
+                    position: egui::pos2(200.0, 0.0),
+                    text: "P_b".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn releasing_a_drag_onto_an_endpoint_prunes_terminal_labels() {
+        let mut canvas = Canvas::default();
+        canvas.doc.elements = vec![
+            Element::Resistor(egui::pos2(0.0, 0.0), egui::pos2(100.0, 0.0)),
+            Element::Resistor(egui::pos2(200.0, 0.0), egui::pos2(300.0, 0.0)),
+        ];
+        canvas.doc.labels = vec![String::new(), String::new()];
+        canvas.doc.terminal_labels = vec![NodeLabel {
+            position: egui::pos2(100.0, 0.0),
+            text: "P_a".into(),
+        }];
+        let dragged = DraggedEndpoint {
+            element_index: 0,
+            is_start: false,
+        };
+        canvas.selected_endpoints = vec![dragged];
+        canvas.begin_endpoint_drag(dragged, egui::pos2(100.0, 0.0));
+        canvas.move_dragged_endpoints(egui::vec2(100.0, 0.0));
+        canvas.end_endpoint_drag();
+
+        // The endpoint now forms a junction, which cannot carry a terminal label.
+        assert!(canvas.doc.terminal_labels.is_empty());
+    }
+
+    #[test]
+    fn label_layout_is_cached_until_the_document_changes() {
+        let ctx = egui::Context::default();
+        crate::label::install_fonts(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        let mut canvas = Canvas::default();
+        canvas.doc.elements = vec![Element::Resistor(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+        )];
+        canvas.doc.labels = vec!["G".into()];
+
+        let first = canvas.cached_label_layout(&ctx).elements[0].unwrap().rect;
+        assert_eq!(
+            canvas.cached_label_layout(&ctx).elements[0].unwrap().rect,
+            first
+        );
+        canvas.doc.labels[0] = "G_(longer label)".into();
+        let changed = canvas.cached_label_layout(&ctx).elements[0].unwrap().rect;
+        assert!(changed.width() > first.width());
+    }
+
+    #[test]
     fn alignment_requires_at_least_two_endpoints() {
         let mut canvas = Canvas::default();
-        canvas.elements.push(Element::Resistor(
+        canvas.doc.elements.push(Element::Resistor(
             egui::pos2(10.0, 20.0),
             egui::pos2(50.0, 80.0),
         ));
-        let original = canvas.elements.clone();
+        let original = canvas.doc.elements.clone();
         for horizontal in [true, false] {
             canvas.align_selected_endpoints(horizontal);
-            assert_eq!(canvas.elements, original);
+            assert_eq!(canvas.doc.elements, original);
         }
         canvas.selected_endpoints.push(DraggedEndpoint {
             element_index: 0,
@@ -2345,7 +2649,7 @@ mod tests {
         });
         for horizontal in [true, false] {
             canvas.align_selected_endpoints(horizontal);
-            assert_eq!(canvas.elements, original);
+            assert_eq!(canvas.doc.elements, original);
         }
     }
 }

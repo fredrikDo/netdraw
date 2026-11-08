@@ -7,67 +7,80 @@ use std::fmt::Write;
 
 use eframe::egui;
 
+use crate::document::Drawing;
 use crate::element::{
-    DIAGRAM_STROKE_WIDTH, Element, JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
-    unconnected_resistor_terminal_positions,
+    DIAGRAM_STROKE_WIDTH, Element, JUNCTION_NODE_RADIUS, junction_positions,
+    prescribed_flow_symbol, resistor_body, terminal_ticks,
 };
-use crate::label;
+use crate::label::{self, LabelLayout};
 
-const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
+/// Extra space around the content so edge strokes are not clipped by the crop.
 const STROKE_MARGIN: f32 = 1.0;
+/// Clipboard images are rendered at this many pixels per canvas point for sharp labels.
+const RASTER_SCALE: f32 = 2.0;
+/// Refuse clipboard images above this pixel count instead of allocating huge buffers.
+const MAX_RASTER_PIXELS: u64 = 32_000_000;
+
+// `write!` into a `String` cannot fail, so the `unwrap()` calls below never panic.
+
+/// How the SVG refers to the label font.
+enum FontSource<'a> {
+    /// Embed the bundled font as a base64 `@font-face`, for standalone SVG files.
+    Embedded,
+    /// Refer to a family already loaded into the renderer's font database. usvg resolves
+    /// installed families rather than `@font-face` rules, and skipping the embedding also
+    /// avoids base64-encoding hundreds of kilobytes that would only be discarded.
+    Installed(&'a str),
+}
 
 /// Export the complete drawing with embedded font data and tightly cropped bounds.
-pub fn svg(
-    ctx: &egui::Context,
-    elements: &[Element],
-    labels: &[String],
-    node_labels: &[label::NodeLabel],
-    terminal_labels: &[label::NodeLabel],
-    label_style: label::LabelStyle,
-) -> String {
-    let label_placements = label::placements(ctx, elements, labels, label_style);
-    let node_label_placements =
-        label::node_placements(ctx, elements, node_labels, &label_placements, label_style);
-    let mut occupied_placements = label_placements.clone();
-    occupied_placements.extend(node_label_placements.iter().copied());
-    let terminal_label_placements = label::terminal_placements(
+pub fn svg(ctx: &egui::Context, drawing: &Drawing) -> String {
+    svg_document(ctx, drawing, FontSource::Embedded)
+}
+
+fn svg_document(ctx: &egui::Context, drawing: &Drawing, font: FontSource) -> String {
+    let style = drawing.label_style;
+    let elements = &drawing.elements;
+    let layout = LabelLayout::compute(
         ctx,
         elements,
-        terminal_labels,
-        &occupied_placements,
-        label_style,
+        &drawing.labels,
+        &drawing.node_labels,
+        &drawing.terminal_labels,
+        style,
     );
-    let bounds = Bounds::for_elements(
-        elements,
-        &label_placements,
-        &node_label_placements,
-        &terminal_label_placements,
-    );
+    let bounds = Bounds::new(elements, &layout);
+    let font_family = match font {
+        FontSource::Embedded => style.svg_family().to_owned(),
+        FontSource::Installed(family) => format!("'{}'", escape_xml(family)),
+    };
+
     let mut output = String::new();
     writeln!(
         output,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {} {}">"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">"#,
         bounds.width(),
         bounds.height(),
-        bounds.width(),
-        bounds.height()
     )
     .unwrap();
-    let (mime_type, font_format) = label_style.font.svg_format();
-    writeln!(
-        output,
-        "  <style>@font-face {{ font-family: '{}'; src: url('data:{};base64,{}') format('{}'); }}</style>",
-        label_style.svg_family(),
-        mime_type,
-        encode_base64(label_style.font.bytes()),
-        font_format,
-    )
-    .unwrap();
+    if let FontSource::Embedded = font {
+        let (mime_type, font_format) = style.font.svg_format();
+        writeln!(
+            output,
+            "  <style>@font-face {{ font-family: '{}'; src: url('data:{};base64,{}') format('{}'); }}</style>",
+            style.svg_family(),
+            mime_type,
+            encode_base64(style.font.bytes()),
+            font_format,
+        )
+        .unwrap();
+    }
     writeln!(
         output,
         r#"  <rect width="100%" height="100%" fill="white"/>"#
     )
     .unwrap();
+    // Shift content so the cropped bounds start at the SVG origin.
     writeln!(
         output,
         r#"  <g transform="translate({} {})">"#,
@@ -80,30 +93,43 @@ pub fn svg(
     )
     .unwrap();
 
+    // Same stacking order as the canvas: symbols, terminal ticks, junction dots.
     for element in elements {
         match *element {
             Element::Resistor(start, end) => resistor(&mut output, start, end),
             Element::PrescribedFlow(start, end) => prescribed_flow(&mut output, start, end),
         }
     }
-
-    resistor_terminal_ticks(&mut output, elements);
-    junction_nodes(&mut output, elements);
+    for [start, end] in terminal_ticks(elements) {
+        line(&mut output, start, end);
+    }
+    for position in junction_positions(elements) {
+        node(&mut output, position);
+    }
 
     writeln!(output, "  </g>").unwrap();
-    for (label, placement) in labels.iter().zip(&label_placements) {
+    let texts = drawing
+        .labels
+        .iter()
+        .map(String::as_str)
+        .zip(&layout.elements)
+        .chain(
+            drawing
+                .node_labels
+                .iter()
+                .map(|label| label.text.as_str())
+                .zip(&layout.nodes),
+        )
+        .chain(
+            drawing
+                .terminal_labels
+                .iter()
+                .map(|label| label.text.as_str())
+                .zip(&layout.terminals),
+        );
+    for (text, placement) in texts {
         if let Some(placement) = placement {
-            svg_label(&mut output, label, *placement, label_style);
-        }
-    }
-    for (node_label, placement) in node_labels.iter().zip(&node_label_placements) {
-        if let Some(placement) = placement {
-            svg_label(&mut output, &node_label.text, *placement, label_style);
-        }
-    }
-    for (terminal_label, placement) in terminal_labels.iter().zip(&terminal_label_placements) {
-        if let Some(placement) = placement {
-            svg_label(&mut output, &terminal_label.text, *placement, label_style);
+            svg_label(&mut output, text, *placement, style.size, &font_family);
         }
     }
     writeln!(output, "  </g>").unwrap();
@@ -111,22 +137,14 @@ pub fn svg(
     output
 }
 
-/// Rasterize the same tightly cropped, clean figure used by SVG export.
-/// Rasterize the shared SVG at two pixels per canvas point on an opaque white background.
-/// Reject images above 32 million pixels before allocating the raster buffer.
-pub fn image(
-    ctx: &egui::Context,
-    elements: &[Element],
-    labels: &[String],
-    node_labels: &[label::NodeLabel],
-    terminal_labels: &[label::NodeLabel],
-    label_style: label::LabelStyle,
-) -> Result<resvg::tiny_skia::Pixmap, String> {
+/// Rasterize the same tightly cropped, clean figure used by SVG export, at
+/// [`RASTER_SCALE`] pixels per canvas point on an opaque white background.
+/// Rejects images above [`MAX_RASTER_PIXELS`] before allocating the raster buffer.
+pub fn image(ctx: &egui::Context, drawing: &Drawing) -> Result<resvg::tiny_skia::Pixmap, String> {
+    let font = drawing.label_style.font;
     let mut options = resvg::usvg::Options::default();
-    options
-        .fontdb_mut()
-        .load_font_data(label_style.font.bytes().to_vec());
-    // usvg resolves installed font families rather than SVG @font-face aliases.
+    options.fontdb_mut().load_font_data(font.bytes().to_vec());
+    // The database holds only this font, so its first face names the family to use.
     let family = options
         .fontdb
         .faces()
@@ -134,33 +152,21 @@ pub fn image(
         .and_then(|face| face.families.first())
         .map(|(name, _)| name.clone())
         .ok_or("Could not load the drawing font.")?;
-    let document = svg(
-        ctx,
-        elements,
-        labels,
-        node_labels,
-        terminal_labels,
-        label_style,
-    )
-    .replace(
-        &format!("font-family=\"{}\"", label_style.svg_family()),
-        &format!("font-family=\"'{}'\"", escape_xml(&family)),
-    );
+    let document = svg_document(ctx, drawing, FontSource::Installed(&family));
     let tree = resvg::usvg::Tree::from_str(&document, &options)
         .map_err(|error| format!("Could not render drawing: {error}"))?;
-    // Two pixels per canvas point keeps pasted labels sharp.
-    let width = (tree.size().width() * 2.0).ceil() as u32;
-    let height = (tree.size().height() * 2.0).ceil() as u32;
-    if u64::from(width) * u64::from(height) > 32_000_000 {
+    let width = (tree.size().width() * RASTER_SCALE).ceil() as u32;
+    let height = (tree.size().height() * RASTER_SCALE).ceil() as u32;
+    if u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS {
         return Err("Drawing is too large to copy as an image.".into());
     }
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or("Could not allocate the drawing image.")?;
-    // Cover fractional edge pixels with white as well.
+    // Rounding the size up leaves fractional edge pixels outside the SVG; fill them white too.
     pixmap.fill(resvg::tiny_skia::Color::WHITE);
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::from_scale(2.0, 2.0),
+        resvg::tiny_skia::Transform::from_scale(RASTER_SCALE, RASTER_SCALE),
         &mut pixmap.as_mut(),
     );
     Ok(pixmap)
@@ -173,12 +179,8 @@ struct Bounds {
 }
 
 impl Bounds {
-    fn for_elements(
-        elements: &[Element],
-        labels: &[Option<label::Placement>],
-        node_labels: &[Option<label::Placement>],
-        terminal_labels: &[Option<label::Placement>],
-    ) -> Self {
+    /// Bounds of everything `svg_document` draws. An empty drawing gets a 1×1 box.
+    fn new(elements: &[Element], layout: &LabelLayout) -> Self {
         let mut bounds = Self {
             min: egui::pos2(f32::INFINITY, f32::INFINITY),
             max: egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY),
@@ -186,23 +188,33 @@ impl Bounds {
 
         for element in elements {
             match *element {
-                Element::Resistor(start, end) => bounds.include_resistor(start, end),
-                Element::PrescribedFlow(start, end) => bounds.include_prescribed_flow(start, end),
+                Element::Resistor(start, end) => {
+                    // Mirrors `resistor`: nothing is drawn when the body is too short.
+                    if let Some(points) = resistor_body(start, end) {
+                        bounds.include(start);
+                        bounds.include(end);
+                        points.into_iter().for_each(|point| bounds.include(point));
+                    }
+                }
+                Element::PrescribedFlow(start, end) => {
+                    if let Some(symbol) = prescribed_flow_symbol(start, end) {
+                        bounds.include(start);
+                        bounds.include(end);
+                        bounds.include_circle(symbol.center, symbol.radius);
+                    }
+                }
             }
         }
-        bounds.include_resistor_terminal_ticks(elements);
-        bounds.include_junction_nodes(elements);
-        for placement in labels.iter().flatten() {
-            bounds.include(placement.rect.min);
-            bounds.include(placement.rect.max);
+        for [start, end] in terminal_ticks(elements) {
+            bounds.include(start);
+            bounds.include(end);
         }
-        for placement in node_labels.iter().flatten() {
-            bounds.include(placement.rect.min);
-            bounds.include(placement.rect.max);
+        for position in junction_positions(elements) {
+            bounds.include_circle(position, JUNCTION_NODE_RADIUS);
         }
-        for placement in terminal_labels.iter().flatten() {
-            bounds.include(placement.rect.min);
-            bounds.include(placement.rect.max);
+        for rect in layout.rects() {
+            bounds.include(rect.min);
+            bounds.include(rect.max);
         }
 
         if !bounds.min.x.is_finite() {
@@ -218,93 +230,13 @@ impl Bounds {
     }
 
     fn include(&mut self, position: egui::Pos2) {
-        self.min.x = self.min.x.min(position.x);
-        self.min.y = self.min.y.min(position.y);
-        self.max.x = self.max.x.max(position.x);
-        self.max.y = self.max.y.max(position.y);
+        self.min = self.min.min(position);
+        self.max = self.max.max(position);
     }
 
     fn include_circle(&mut self, center: egui::Pos2, radius: f32) {
         self.include(center - egui::Vec2::splat(radius));
         self.include(center + egui::Vec2::splat(radius));
-    }
-
-    fn include_resistor(&mut self, start: egui::Pos2, end: egui::Pos2) {
-        if let Some(points) = resistor_body(start, end) {
-            self.include(start);
-            self.include(end);
-            for point in points {
-                self.include(point);
-            }
-        }
-    }
-
-    fn include_prescribed_flow(&mut self, start: egui::Pos2, end: egui::Pos2) {
-        let offset = end - start;
-        let length = offset.length();
-        if length == 0.0 {
-            return;
-        }
-
-        self.include(start);
-        self.include(end);
-        self.include_circle(
-            start + offset * 0.5,
-            PRESCRIBED_FLOW_RADIUS.min(length / 2.0),
-        );
-    }
-
-    fn include_resistor_terminal_ticks(&mut self, elements: &[Element]) {
-        let terminals = unconnected_resistor_terminal_positions(elements);
-
-        for element in elements {
-            let Element::Resistor(start, end) = *element else {
-                continue;
-            };
-            let direction = end - start;
-            let length = direction.length();
-            if length == 0.0 {
-                continue;
-            }
-
-            let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-            let half_length = resistor_half_width(length);
-            for position in [start, end] {
-                if terminals.contains(&position) {
-                    self.include(position - perpendicular * half_length);
-                    self.include(position + perpendicular * half_length);
-                }
-            }
-        }
-    }
-
-    fn include_junction_nodes(&mut self, elements: &[Element]) {
-        let mut resistor_endpoints: Vec<(egui::Pos2, usize)> = Vec::new();
-        for element in elements {
-            if let Element::Resistor(start, end) = *element {
-                for position in [start, end] {
-                    if let Some((_, count)) = resistor_endpoints
-                        .iter_mut()
-                        .find(|(existing_position, _)| *existing_position == position)
-                    {
-                        *count += 1;
-                    } else {
-                        resistor_endpoints.push((position, 1));
-                    }
-                }
-            }
-        }
-
-        for (position, count) in resistor_endpoints {
-            if count >= 2 {
-                self.include_circle(position, JUNCTION_NODE_RADIUS);
-            }
-        }
-        for element in elements {
-            if let Element::PrescribedFlow(_, end) = *element {
-                self.include_circle(end, JUNCTION_NODE_RADIUS);
-            }
-        }
     }
 
     fn width(&self) -> f32 {
@@ -316,6 +248,7 @@ impl Bounds {
     }
 }
 
+/// Escape text for use in XML character data and attribute values.
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -325,19 +258,22 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Write one label as `<text>` with a `<tspan>` per script span. The baseline sits one
+/// font size below the placement's top edge, approximating the canvas galley layout.
 fn svg_label(
     output: &mut String,
     text: &str,
     placement: label::Placement,
-    style: label::LabelStyle,
+    font_size: f32,
+    font_family: &str,
 ) {
     write!(
         output,
         r#"  <text x="{}" y="{}" font-family="{}" font-size="{}" fill="black">"#,
         placement.rect.left(),
-        placement.rect.top() + style.size,
-        style.svg_family(),
-        style.size,
+        placement.rect.top() + font_size,
+        font_family,
+        font_size,
     )
     .unwrap();
     for span in label::parse_label(text) {
@@ -358,6 +294,7 @@ fn svg_label(
     writeln!(output, "</text>").unwrap();
 }
 
+/// Standard padded base64 (RFC 4648), avoiding a dependency for one call site.
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -381,63 +318,6 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-fn resistor_terminal_ticks(output: &mut String, elements: &[Element]) {
-    let terminals = unconnected_resistor_terminal_positions(elements);
-
-    for element in elements {
-        let Element::Resistor(start, end) = *element else {
-            continue;
-        };
-        let direction = end - start;
-        let length = direction.length();
-        if length == 0.0 {
-            continue;
-        }
-
-        let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-        let half_length = resistor_half_width(length);
-        for position in [start, end] {
-            if terminals.contains(&position) {
-                line(
-                    output,
-                    position - perpendicular * half_length,
-                    position + perpendicular * half_length,
-                    DIAGRAM_STROKE_WIDTH,
-                );
-            }
-        }
-    }
-}
-
-fn junction_nodes(output: &mut String, elements: &[Element]) {
-    let mut resistor_endpoints: Vec<(egui::Pos2, usize)> = Vec::new();
-    for element in elements {
-        if let Element::Resistor(start, end) = *element {
-            for position in [start, end] {
-                if let Some((_, count)) = resistor_endpoints
-                    .iter_mut()
-                    .find(|(existing_position, _)| *existing_position == position)
-                {
-                    *count += 1;
-                } else {
-                    resistor_endpoints.push((position, 1));
-                }
-            }
-        }
-    }
-
-    for (position, count) in resistor_endpoints {
-        if count >= 2 {
-            node(output, position);
-        }
-    }
-    for element in elements {
-        if let Element::PrescribedFlow(_, end) = *element {
-            node(output, end);
-        }
-    }
-}
-
 fn node(output: &mut String, position: egui::Pos2) {
     writeln!(
         output,
@@ -447,11 +327,11 @@ fn node(output: &mut String, position: egui::Pos2) {
     .unwrap();
 }
 
-fn line(output: &mut String, start: egui::Pos2, end: egui::Pos2, width: f32) {
+fn line(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
     writeln!(
         output,
         r#"    <line x1="{}" y1="{}" x2="{}" y2="{}" stroke-width="{}"/>"#,
-        start.x, start.y, end.x, end.y, width
+        start.x, start.y, end.x, end.y, DIAGRAM_STROKE_WIDTH
     )
     .unwrap();
 }
@@ -460,8 +340,8 @@ fn resistor(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
     let Some(points) = resistor_body(start, end) else {
         return;
     };
-    line(output, start, points[0], DIAGRAM_STROKE_WIDTH);
-    line(output, *points.last().unwrap(), end, DIAGRAM_STROKE_WIDTH);
+    line(output, start, points[0]);
+    line(output, *points.last().unwrap(), end);
     let mut path = format!("M {} {}", points[0].x, points[0].y);
     for point in &points[1..] {
         write!(path, " L {} {}", point.x, point.y).unwrap();
@@ -475,46 +355,24 @@ fn resistor(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
 }
 
 fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
-    let offset = end - start;
-    let length = offset.length();
-    if length == 0.0 {
+    let Some(symbol) = prescribed_flow_symbol(start, end) else {
         return;
+    };
+    for [lead_start, lead_end] in symbol.leads {
+        line(output, lead_start, lead_end);
     }
-
-    let direction = offset / length;
-    let center = start + offset * 0.5;
-    let radius = PRESCRIBED_FLOW_RADIUS.min(length / 2.0);
-    line(
-        output,
-        start,
-        center - direction * radius,
-        DIAGRAM_STROKE_WIDTH,
-    );
-    line(
-        output,
-        center + direction * radius,
-        end,
-        DIAGRAM_STROKE_WIDTH,
-    );
     writeln!(
         output,
-        r#"    <circle cx="{}" cy="{}" r="{}" fill="white" stroke-width="1"/>"#,
-        center.x, center.y, radius
+        r#"    <circle cx="{}" cy="{}" r="{}" fill="white" stroke-width="{}"/>"#,
+        symbol.center.x, symbol.center.y, symbol.radius, DIAGRAM_STROKE_WIDTH
     )
     .unwrap();
-
-    let arrow_start = center - direction * (radius * 0.55);
-    let arrow_tip = center + direction * (radius * 0.55);
-    let perpendicular = egui::Vec2::new(-direction.y, direction.x);
-    let arrowhead_base = arrow_tip - direction * (radius * 0.4);
-    let arrowhead_width = radius * 0.22;
-    line(output, arrow_start, arrowhead_base, DIAGRAM_STROKE_WIDTH);
-    let left = arrowhead_base + perpendicular * arrowhead_width;
-    let right = arrowhead_base - perpendicular * arrowhead_width;
+    line(output, symbol.shaft[0], symbol.shaft[1]);
+    let [tip, left, right] = symbol.head;
     writeln!(
         output,
         r#"    <polygon points="{},{} {},{} {},{}" fill="black" stroke="none"/>"#,
-        arrow_tip.x, arrow_tip.y, left.x, left.y, right.x, right.y
+        tip.x, tip.y, left.x, left.y, right.x, right.y
     )
     .unwrap();
 }
@@ -522,6 +380,17 @@ fn prescribed_flow(output: &mut String, start: egui::Pos2, end: egui::Pos2) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a drawing without position labels; `labels` may be shorter than `elements`.
+    fn drawing(elements: &[Element], labels: &[String], label_style: label::LabelStyle) -> Drawing {
+        Drawing {
+            elements: elements.to_vec(),
+            labels: labels.to_vec(),
+            node_labels: Vec::new(),
+            terminal_labels: Vec::new(),
+            label_style,
+        }
+    }
 
     fn test_context() -> egui::Context {
         let ctx = egui::Context::default();
@@ -541,11 +410,11 @@ mod tests {
 
         let document = svg(
             &ctx,
-            &elements,
-            &[String::new(), String::new()],
-            &[],
-            &[],
-            label::LabelStyle::default(),
+            &drawing(
+                &elements,
+                &[String::new(), String::new()],
+                label::LabelStyle::default(),
+            ),
         );
 
         assert!(document.starts_with("<svg"));
@@ -565,11 +434,11 @@ mod tests {
         let ctx = test_context();
         let document = svg(
             &ctx,
-            &elements,
-            &[String::from("R<1 & R>2")],
-            &[],
-            &[],
-            label::LabelStyle::default(),
+            &drawing(
+                &elements,
+                &[String::from("R<1 & R>2")],
+                label::LabelStyle::default(),
+            ),
         );
 
         assert!(document.contains("<text"));
@@ -586,11 +455,11 @@ mod tests {
         for font in label::LabelFont::ALL {
             let document = svg(
                 &ctx,
-                &elements,
-                &[String::from("R1")],
-                &[],
-                &[],
-                label::LabelStyle { font, size: 22.0 },
+                &drawing(
+                    &elements,
+                    &[String::from("R1")],
+                    label::LabelStyle { font, size: 22.0 },
+                ),
             );
             assert!(document.contains(&format!("font-family=\"NetDraw {}\"", font.display_name())));
             assert!(document.contains(r#"font-size="22""#));
@@ -607,7 +476,7 @@ mod tests {
             egui::pos2(500.0, 600.0),
             egui::pos2(600.0, 600.0),
         )];
-        let image = image(&ctx, &elements, &[], &[], &[], label::LabelStyle::default()).unwrap();
+        let image = image(&ctx, &drawing(&elements, &[], label::LabelStyle::default())).unwrap();
         assert_eq!((image.width(), image.height()), (204, 44));
         assert!(image.data().chunks_exact(4).all(|pixel| pixel[3] == 255));
         assert!(image.data().chunks_exact(4).any(|pixel| pixel[0] < 128));
@@ -624,20 +493,16 @@ mod tests {
         for font in label::LabelFont::ALL {
             let with_label = image(
                 &ctx,
-                &elements,
-                &["R_(load)^2".into()],
-                &[],
-                &[],
-                label::LabelStyle { font, size: 22.0 },
+                &drawing(
+                    &elements,
+                    &["R_(load)^2".into()],
+                    label::LabelStyle { font, size: 22.0 },
+                ),
             )
             .unwrap();
             let without_label = image(
                 &ctx,
-                &elements,
-                &[],
-                &[],
-                &[],
-                label::LabelStyle { font, size: 22.0 },
+                &drawing(&elements, &[], label::LabelStyle { font, size: 22.0 }),
             )
             .unwrap();
             let dark_pixels = |image: &resvg::tiny_skia::Pixmap| {
@@ -661,7 +526,7 @@ mod tests {
             egui::Pos2::ZERO,
             egui::pos2(100_000.0, 100_000.0),
         )];
-        assert!(image(&ctx, &elements, &[], &[], &[], label::LabelStyle::default()).is_err());
+        assert!(image(&ctx, &drawing(&elements, &[], label::LabelStyle::default())).is_err());
     }
 
     #[test]
@@ -680,11 +545,11 @@ mod tests {
         let ctx = test_context();
         let document = svg(
             &ctx,
-            &elements,
-            &[String::from("R_(load)^2")],
-            &[],
-            &[],
-            label::LabelStyle::default(),
+            &drawing(
+                &elements,
+                &[String::from("R_(load)^2")],
+                label::LabelStyle::default(),
+            ),
         );
 
         assert!(document.contains(r#"baseline-shift="sub">load</tspan>"#));
@@ -701,11 +566,7 @@ mod tests {
         let ctx = test_context();
         let document = svg(
             &ctx,
-            &elements,
-            &[String::new()],
-            &[],
-            &[],
-            label::LabelStyle::default(),
+            &drawing(&elements, &[String::new()], label::LabelStyle::default()),
         );
         let resistor_path = document
             .lines()

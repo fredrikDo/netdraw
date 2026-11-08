@@ -7,27 +7,40 @@ use eframe::egui;
 
 use crate::element::{
     DIAGRAM_STROKE_WIDTH, ENDPOINT_INTERACTION_DISTANCE, ENDPOINT_RADIUS, Element,
-    JUNCTION_NODE_RADIUS, resistor_body, resistor_half_width,
-    unconnected_resistor_terminal_positions,
+    JUNCTION_NODE_RADIUS, junction_positions, prescribed_flow_symbol, resistor_body,
+    terminal_ticks,
 };
 use crate::label::{LabelStyle, Placement};
 
-const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
+const DIAGRAM_STROKE: egui::Stroke = egui::Stroke {
+    width: DIAGRAM_STROKE_WIDTH,
+    color: egui::Color32::BLACK,
+};
 
-pub fn draw_elements(painter: &egui::Painter, elements: &[Element]) {
+/// Paint the complete diagram (no editing overlays) in stacking order: element
+/// symbols, then terminal ticks, then junction dots on top.
+pub fn draw_diagram(painter: &egui::Painter, elements: &[Element]) {
     for element in elements {
         draw_element(painter, *element);
     }
+    for tick in terminal_ticks(elements) {
+        painter.line_segment(tick, DIAGRAM_STROKE);
+    }
+    for position in junction_positions(elements) {
+        painter.circle_filled(position, JUNCTION_NODE_RADIUS, egui::Color32::BLACK);
+    }
 }
 
-pub fn draw_labels(
+/// Paint placed labels. `labels` and `placements` correspond by index; the label at
+/// `editing_label` is skipped because its text editor is drawn in its place.
+pub fn draw_labels<'a>(
     painter: &egui::Painter,
-    labels: &[String],
+    labels: impl IntoIterator<Item = &'a str>,
     placements: &[Option<Placement>],
     editing_label: Option<usize>,
     style: LabelStyle,
 ) {
-    for (index, (label, placement)) in labels.iter().zip(placements).enumerate() {
+    for (index, (label, placement)) in labels.into_iter().zip(placements).enumerate() {
         if label.is_empty() || editing_label == Some(index) {
             continue;
         }
@@ -41,6 +54,7 @@ pub fn draw_labels(
     }
 }
 
+/// Paint one element symbol; also used for the preview while a new element is dragged.
 pub fn draw_element(painter: &egui::Painter, element: Element) {
     match element {
         Element::Resistor(start, end) => draw_resistor(painter, start, end),
@@ -48,145 +62,48 @@ pub fn draw_element(painter: &egui::Painter, element: Element) {
     }
 }
 
-// Draw small handles only for endpoints near the pointer.
+/// Outline the handles of endpoints near the pointer, hinting what can be grabbed.
 pub fn draw_endpoint_handles(
     painter: &egui::Painter,
     elements: &[Element],
     pointer_position: Option<egui::Pos2>,
 ) {
+    let Some(pointer) = pointer_position else {
+        return;
+    };
+    let stroke = egui::Stroke::new(1.0, egui::Color32::PURPLE);
     for element in elements {
         let (start, end) = element.endpoints();
-
         for point in [start, end] {
-            if !pointer_position
-                .is_some_and(|pointer| pointer.distance(point) <= ENDPOINT_INTERACTION_DISTANCE)
-            {
-                continue;
-            }
-
-            // Decide later whether the handle should be filled or not!
-            // painter.circle_filled(point, ENDPOINT_RADIUS, egui::Color32::WHITE);
-            painter.circle_stroke(
-                point,
-                ENDPOINT_RADIUS,
-                egui::Stroke::new(1.0, egui::Color32::PURPLE),
-            );
-        }
-    }
-}
-
-// Draw a junction node wherever two or more resistor endpoints share a position.
-pub fn draw_resistor_junction_nodes(painter: &egui::Painter, elements: &[Element]) {
-    let mut endpoint_groups: Vec<(egui::Pos2, usize)> = Vec::new();
-
-    for element in elements {
-        if let Element::Resistor(start, end) = element {
-            for position in [*start, *end] {
-                if let Some((_, count)) = endpoint_groups
-                    .iter_mut()
-                    .find(|(group_position, _)| *group_position == position)
-                {
-                    *count += 1;
-                } else {
-                    endpoint_groups.push((position, 1));
-                }
-            }
-        }
-    }
-
-    for (position, count) in endpoint_groups {
-        if count >= 2 {
-            painter.circle_filled(position, JUNCTION_NODE_RADIUS, egui::Color32::BLACK);
-        }
-    }
-}
-
-// The arrow tip is the prescribed-flow symbol's only connectable endpoint.
-pub fn draw_prescribed_flow_junction_nodes(painter: &egui::Painter, elements: &[Element]) {
-    for element in elements {
-        if let Element::PrescribedFlow(_, end) = element {
-            painter.circle_filled(*end, JUNCTION_NODE_RADIUS, egui::Color32::BLACK);
-        }
-    }
-}
-
-// Mark the solver's free terminals with a tick so the drawing shows what needs a label.
-pub fn draw_unconnected_resistor_terminals(painter: &egui::Painter, elements: &[Element]) {
-    let terminals = unconnected_resistor_terminal_positions(elements);
-
-    for element in elements {
-        let Element::Resistor(start, end) = element else {
-            continue;
-        };
-
-        let direction = *end - *start;
-        let length = direction.length();
-        if length == 0.0 {
-            continue;
-        }
-
-        let perpendicular = egui::Vec2::new(-direction.y, direction.x) / length;
-        let half_length = resistor_half_width(length);
-
-        for position in [*start, *end] {
-            if terminals.contains(&position) {
-                painter.line_segment(
-                    [
-                        position - perpendicular * half_length,
-                        position + perpendicular * half_length,
-                    ],
-                    egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK),
-                );
+            if pointer.distance(point) <= ENDPOINT_INTERACTION_DISTANCE {
+                painter.circle_stroke(point, ENDPOINT_RADIUS, stroke);
             }
         }
     }
 }
 
-pub fn draw_resistor(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
+fn draw_resistor(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
     let Some(points) = resistor_body(start, end) else {
         return;
     };
-    let stroke = egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK);
-    painter.line_segment([start, points[0]], stroke);
-    painter.line_segment([*points.last().unwrap(), end], stroke);
-    painter.add(egui::Shape::line(points, stroke));
+    painter.line_segment([start, points[0]], DIAGRAM_STROKE);
+    painter.line_segment([*points.last().unwrap(), end], DIAGRAM_STROKE);
+    painter.add(egui::Shape::line(points, DIAGRAM_STROKE));
 }
 
-// Draw an IEEE-style independent current source: lead wires, a centered circle, and an arrow.
 fn draw_prescribed_flow(painter: &egui::Painter, start: egui::Pos2, end: egui::Pos2) {
-    let stroke = egui::Stroke::new(DIAGRAM_STROKE_WIDTH, egui::Color32::BLACK);
-    let offset = end - start;
-    let length = offset.length();
-
-    if length == 0.0 {
+    let Some(symbol) = prescribed_flow_symbol(start, end) else {
         return;
+    };
+    for lead in symbol.leads {
+        painter.line_segment(lead, DIAGRAM_STROKE);
     }
-
-    let direction = offset / length;
-    let center = start + offset * 0.5;
-    let radius = PRESCRIBED_FLOW_RADIUS.min((length / 2.0).max(0.0));
-    let circle_start = center - direction * radius;
-    let circle_end = center + direction * radius;
-
-    painter.line_segment([start, circle_start], stroke);
-    painter.line_segment([circle_end, end], stroke);
-    painter.circle_filled(center, radius, egui::Color32::WHITE);
-    painter.circle_stroke(center, radius, stroke);
-
-    let arrow_start = center - direction * (radius * 0.55);
-    let arrow_tip = center + direction * (radius * 0.55);
-    let perpendicular = egui::Vec2::new(-direction.y, direction.x);
-    let arrowhead_length = radius * 0.4;
-    let arrowhead_width = radius * 0.22;
-    let arrowhead_base = arrow_tip - direction * arrowhead_length;
-
-    painter.line_segment([arrow_start, arrowhead_base], stroke);
+    // Fill the circle so elements drawn underneath do not show through the symbol.
+    painter.circle_filled(symbol.center, symbol.radius, egui::Color32::WHITE);
+    painter.circle_stroke(symbol.center, symbol.radius, DIAGRAM_STROKE);
+    painter.line_segment(symbol.shaft, DIAGRAM_STROKE);
     painter.add(egui::Shape::convex_polygon(
-        vec![
-            arrow_tip,
-            arrowhead_base + perpendicular * arrowhead_width,
-            arrowhead_base - perpendicular * arrowhead_width,
-        ],
+        symbol.head.to_vec(),
         egui::Color32::BLACK,
         egui::Stroke::NONE,
     ));

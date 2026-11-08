@@ -8,8 +8,14 @@ use std::sync::Arc;
 
 use crate::element::Element;
 
+/// Minimum gap kept between a label rectangle and any element's centre line.
 const ELEMENT_CLEARANCE: f32 = 8.0;
+/// Script spans are drawn at this fraction of the base size, on canvas and in SVG.
+const SCRIPT_SCALE: f32 = 0.7;
+/// Padding added to measured text so neighbouring labels never touch.
+const LABEL_PADDING: egui::Vec2 = egui::vec2(4.0, 4.0);
 
+/// Bundled label typefaces. Serialized names live in `document::SavedFont`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelFont {
     Inter,
@@ -18,12 +24,14 @@ pub enum LabelFont {
     AtkinsonHyperlegible,
 }
 
+/// Drawing-wide label typography; every label uses the same font and size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelStyle {
     pub font: LabelFont,
     pub size: f32,
 }
 
+/// Vertical placement of one run of label text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptPosition {
     Normal,
@@ -31,6 +39,7 @@ pub enum ScriptPosition {
     Superscript,
 }
 
+/// A run of label text sharing one script position, produced by [`parse_label`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabelSpan {
     pub text: String,
@@ -47,16 +56,22 @@ impl Default for LabelStyle {
 }
 
 impl LabelStyle {
+    /// Allowed font sizes in points, enforced by the typography dialog and file loading.
+    pub const SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=48.0;
+
+    /// Base-size font for widgets (text editor, preview) that cannot render scripts.
     pub fn font_id(self) -> egui::FontId {
         egui::FontId::new(self.size, egui::FontFamily::Name(self.font.key().into()))
     }
 
+    /// Font-family name under which SVG export embeds the font.
     pub fn svg_family(self) -> &'static str {
         self.font.svg_family()
     }
 
+    /// Padded size of the rendered label, used for placement and collision tests.
     fn text_size(self, ctx: &egui::Context, text: &str) -> egui::Vec2 {
-        self.galley(ctx, text).size() + egui::vec2(4.0, 4.0)
+        self.galley(ctx, text).size() + LABEL_PADDING
     }
 
     /// Use the same script spans and embedded font metrics for canvas and export layout.
@@ -65,8 +80,8 @@ impl LabelStyle {
         for span in parse_label(text) {
             let (size, valign) = match span.position {
                 ScriptPosition::Normal => (self.size, egui::Align::BOTTOM),
-                ScriptPosition::Subscript => (self.size * 0.7, egui::Align::BOTTOM),
-                ScriptPosition::Superscript => (self.size * 0.7, egui::Align::TOP),
+                ScriptPosition::Subscript => (self.size * SCRIPT_SCALE, egui::Align::BOTTOM),
+                ScriptPosition::Superscript => (self.size * SCRIPT_SCALE, egui::Align::TOP),
             };
             job.append(
                 &span.text,
@@ -82,11 +97,16 @@ impl LabelStyle {
                 },
             );
         }
+        // egui caches galleys by job, so re-laying out unchanged labels each frame is cheap.
         ctx.fonts_mut(|fonts| fonts.layout_job(job))
     }
 }
 
 /// Split display scripts and escapes into spans; the solver keeps the original literal name.
+///
+/// Typst-like notation: `_x` / `^x` script the next character only, `_(...)` / `^(...)`
+/// script a parenthesized group (nesting allowed), and `\` escapes the next character.
+/// A trailing marker with nothing after it is kept literally.
 pub fn parse_label(input: &str) -> Vec<LabelSpan> {
     let mut spans = Vec::new();
     let mut normal = String::new();
@@ -153,6 +173,7 @@ pub fn parse_label(input: &str) -> Vec<LabelSpan> {
 }
 
 impl LabelFont {
+    /// Every font, in the order shown in the typography dialog.
     pub const ALL: [Self; 4] = [
         Self::Inter,
         Self::SourceSerif4,
@@ -169,6 +190,7 @@ impl LabelFont {
         }
     }
 
+    /// Name of the egui font family registered by [`install_fonts`].
     fn key(self) -> &'static str {
         match self {
             Self::Inter => "netdraw_inter",
@@ -199,6 +221,7 @@ impl LabelFont {
         }
     }
 
+    /// `(MIME type, CSS format())` for the embedded `@font-face` source.
     pub fn svg_format(self) -> (&'static str, &'static str) {
         match self {
             Self::SourceSerif4 => ("font/otf", "opentype"),
@@ -243,8 +266,83 @@ pub struct NodeLabel {
     pub text: String,
 }
 
+/// Placements for every label kind, in the same order as their source vectors.
+pub struct LabelLayout {
+    pub elements: Vec<Option<Placement>>,
+    pub nodes: Vec<Option<Placement>>,
+    pub terminals: Vec<Option<Placement>>,
+}
+
+impl LabelLayout {
+    /// Place all labels of a drawing. Order matters: element labels claim space first,
+    /// then node labels avoid them, then terminal labels avoid both. The canvas and the
+    /// exporter both call this so on-screen and exported layouts are identical.
+    pub fn compute(
+        ctx: &egui::Context,
+        elements: &[Element],
+        labels: &[String],
+        node_labels: &[NodeLabel],
+        terminal_labels: &[NodeLabel],
+        style: LabelStyle,
+    ) -> Self {
+        let element_placements = placements(ctx, elements, labels, style);
+        let node_placements =
+            node_placements(ctx, elements, node_labels, &element_placements, style);
+        let mut occupied = element_placements.clone();
+        occupied.extend(node_placements.iter().copied());
+        let terminal_placements =
+            terminal_placements(ctx, elements, terminal_labels, &occupied, style);
+        Self {
+            elements: element_placements,
+            nodes: node_placements,
+            terminals: terminal_placements,
+        }
+    }
+
+    /// Every placed rectangle, regardless of label kind.
+    pub fn rects(&self) -> impl Iterator<Item = egui::Rect> + '_ {
+        self.elements
+            .iter()
+            .chain(&self.nodes)
+            .chain(&self.terminals)
+            .flatten()
+            .map(|placement| placement.rect)
+    }
+
+    /// The same layout shifted by `offset`, e.g. from canvas to screen coordinates.
+    pub fn translated(&self, offset: egui::Vec2) -> Self {
+        let shift = |placements: &[Option<Placement>]| {
+            placements
+                .iter()
+                .map(|placement| {
+                    placement.map(|placement| Placement {
+                        rect: placement.rect.translate(offset),
+                    })
+                })
+                .collect()
+        };
+        Self {
+            elements: shift(&self.elements),
+            nodes: shift(&self.nodes),
+            terminals: shift(&self.terminals),
+        }
+    }
+}
+
+/// A candidate rectangle is usable if it keeps clear of every element and every label
+/// placed so far.
+fn is_clear(rect: egui::Rect, elements: &[Element], placed: &[Option<Placement>]) -> bool {
+    elements
+        .iter()
+        .all(|element| clears_element(rect, *element))
+        && placed
+            .iter()
+            .flatten()
+            .all(|other| !rect.intersects(other.rect))
+}
+
 /// Place element labels in element order; empty labels retain a `None` entry.
-pub fn placements(
+fn placements(
     ctx: &egui::Context,
     elements: &[Element],
     labels: &[String],
@@ -273,6 +371,7 @@ pub fn placements(
         let mut placement = None;
         // These are perpendicular distances from the element's midpoint to the label's center.
         // Start close to the element, then move outward until the label clears the diagram.
+        // Arrows start farther out because their circle is wider than the zigzag.
         let initial_distance = if matches!(element, Element::Resistor(..)) {
             26.0
         } else {
@@ -282,12 +381,7 @@ pub fn placements(
             for side in [1.0, -1.0] {
                 let rect =
                     egui::Rect::from_center_size(center + perpendicular * distance * side, size);
-                if elements.iter().all(|other| clears_element(rect, *other))
-                    && placed
-                        .iter()
-                        .flatten()
-                        .all(|other| !rect.intersects(other.rect))
-                {
+                if is_clear(rect, elements, &placed) {
                     placement = Some(Placement { rect });
                     break;
                 }
@@ -297,8 +391,8 @@ pub fn placements(
             }
         }
 
-        // A densely packed diagram may leave no completely clear candidate. Keep the label near
-        // its element, choosing the least surprising side rather than hiding it.
+        // A densely packed diagram may leave no completely clear candidate. Keep the label at
+        // its first-choice position (closest distance, positive side) rather than hiding it.
         placed.push(placement.or_else(|| {
             Some(Placement {
                 rect: egui::Rect::from_center_size(center + perpendicular * initial_distance, size),
@@ -310,7 +404,7 @@ pub fn placements(
 }
 
 /// Place node labels after element labels, trying nearby directions before a fallback.
-pub fn node_placements(
+fn node_placements(
     ctx: &egui::Context,
     elements: &[Element],
     node_labels: &[NodeLabel],
@@ -328,7 +422,8 @@ pub fn node_placements(
         let size = style.text_size(ctx, &node_label.text);
         let mut placement = None;
         // These are distances from the junction endpoint to the label's center. At each
-        // distance, try the cardinal and diagonal directions before moving farther away.
+        // distance, try below, above, right, left, then the two down-right/up-left diagonals
+        // before moving farther away.
         for distance in [8.0, 16.0, 28.0, 46.0, 64.0, 82.0, 100.0] {
             for offset in [
                 egui::Vec2::Y,
@@ -340,14 +435,7 @@ pub fn node_placements(
             ] {
                 let rect =
                     egui::Rect::from_center_size(node_label.position + offset * distance, size);
-                if elements
-                    .iter()
-                    .all(|element| clears_element(rect, *element))
-                    && placed
-                        .iter()
-                        .flatten()
-                        .all(|other| !rect.intersects(other.rect))
-                {
+                if is_clear(rect, elements, &placed) {
                     placement = Some(Placement { rect });
                     break;
                 }
@@ -372,7 +460,7 @@ pub fn node_placements(
 }
 
 /// Place boundary labels along an attached zigzag axis, avoiding occupied rectangles.
-pub fn terminal_placements(
+fn terminal_placements(
     ctx: &egui::Context,
     elements: &[Element],
     terminal_labels: &[NodeLabel],
@@ -408,15 +496,7 @@ pub fn terminal_placements(
         let rect = [8.0, 16.0, 26.0, 44.0, 62.0, 80.0]
             .into_iter()
             .map(candidate)
-            .find(|rect| {
-                elements
-                    .iter()
-                    .all(|element| clears_element(*rect, *element))
-                    && placed
-                        .iter()
-                        .flatten()
-                        .all(|other| !rect.intersects(other.rect))
-            })
+            .find(|rect| is_clear(*rect, elements, &placed))
             .unwrap_or_else(|| candidate(8.0));
         let placement = Some(Placement { rect });
         placed.push(placement);
@@ -426,6 +506,8 @@ pub fn terminal_placements(
     terminal_placements
 }
 
+/// Unit vector pointing outward along the resistor that ends at `position`, i.e. away
+/// from the zigzag. `None` if no resistor ends there (e.g. a stale label).
 fn terminal_direction(elements: &[Element], position: egui::Pos2) -> Option<egui::Vec2> {
     elements.iter().find_map(|element| {
         let Element::Resistor(start, end) = *element else {
@@ -442,6 +524,7 @@ fn terminal_direction(elements: &[Element], position: egui::Pos2) -> Option<egui
     })
 }
 
+/// Conservative test against the element's centre line, widened by [`ELEMENT_CLEARANCE`].
 fn clears_element(rect: egui::Rect, element: Element) -> bool {
     let (start, end) = element.endpoints();
     !segment_intersects_rect(start, end, rect.expand(ELEMENT_CLEARANCE))
@@ -460,6 +543,8 @@ fn segment_intersects_rect(start: egui::Pos2, end: egui::Pos2, rect: egui::Rect)
         .any(|(edge_start, edge_end)| segments_intersect(start, end, edge_start, edge_end))
 }
 
+/// Proper segment intersection; parallel (including collinear) segments report `false`,
+/// which is acceptable because `segment_intersects_rect` also tests contained endpoints.
 fn segments_intersect(
     first_start: egui::Pos2,
     first_end: egui::Pos2,
@@ -479,6 +564,7 @@ fn segments_intersect(
     (0.0..=1.0).contains(&first_progress) && (0.0..=1.0).contains(&second_progress)
 }
 
+/// 2D cross product (z component of the 3D cross product).
 fn cross(first: egui::Vec2, second: egui::Vec2) -> f32 {
     first.x * second.y - first.y * second.x
 }

@@ -2,6 +2,8 @@
 
 use eframe::egui;
 
+/// Render the icon at 256×256 and convert to the straight-alpha RGBA egui expects
+/// (tiny-skia pixmaps store premultiplied alpha).
 pub fn app_icon() -> egui::IconData {
     let tree = resvg::usvg::Tree::from_str(
         include_str!("../assets/icons/netdraw.svg"),

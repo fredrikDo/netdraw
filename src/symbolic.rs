@@ -1,20 +1,39 @@
 //! Exact rational functions and linear elimination, independent of drawing/UI code.
+//!
+//! Work limits below keep pathological inputs from freezing the solver; when one is
+//! hit the user gets "Expression is too large" instead of a result. Keep the table in
+//! `docs/architecture.md` in sync with these constants.
+
 use crate::symbolic_format::{Formula, determinant};
 use num_bigint::BigInt;
 use num_traits::{One, Signed, Zero};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-// Sorted symbols encode a monomial: [a, a, b] means a^2*b; [] means 1.
+/// Sorted symbols encode a monomial: `[a, a, b]` means `a^2*b`; `[]` means 1.
 type Monomial = Vec<String>;
-/// Sparse integer polynomial. Canonical operations remove zero coefficients.
+
+/// Sparse integer polynomial. Canonical operations remove zero coefficients, so the
+/// empty map is zero and structural equality is mathematical equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Polynomial(BTreeMap<Monomial, BigInt>);
-// Bound intermediate growth as well as final output; a node cap alone is insufficient.
+
+/// Bound intermediate growth as well as final output; a node cap alone is insufficient.
 const MAX_TERMS: usize = 2048;
-// Bounds the work of one multiplication; results are still capped at MAX_TERMS.
+/// Bounds the work of one multiplication; results are still capped at `MAX_TERMS`.
 const MAX_PRODUCT_PAIRS: usize = 1 << 20;
+/// A Bareiss cross product may briefly exceed `MAX_TERMS` before its exact division
+/// shrinks it back to the size of a minor.
+const MAX_CROSS_PRODUCT_TERMS: usize = MAX_TERMS * 8;
+/// Give up on an exact division whose remainder grows past this; it is not dividing out.
+const MAX_REMAINDER_TERMS: usize = MAX_TERMS * 4;
+/// Cancellation candidates tracked per expression; each costs trial divisions.
+const MAX_FACTOR_CANDIDATES: usize = 64;
+
+const TOO_LARGE: &str = "Expression is too large; reduce the network first.";
+
 type AlgebraResult<T> = Result<T, String>;
+
 impl Polynomial {
     fn constant(n: i32) -> Self {
         Self(if n == 0 {
@@ -36,7 +55,7 @@ impl Polynomial {
         }
         terms.retain(|_, c| !c.is_zero());
         if terms.len() > max_terms {
-            return Err("Expression is too large; reduce the network first.".into());
+            return Err(TOO_LARGE.into());
         }
         Ok(Self(terms))
     }
@@ -48,7 +67,7 @@ impl Polynomial {
     }
     fn mul_bounded(&self, other: &Self, max_terms: usize) -> AlgebraResult<Self> {
         if self.0.len().saturating_mul(other.0.len()) > MAX_PRODUCT_PAIRS {
-            return Err("Expression is too large; reduce the network first.".into());
+            return Err(TOO_LARGE.into());
         }
         let mut terms = BTreeMap::<Monomial, BigInt>::new();
         for (a, x) in &self.0 {
@@ -61,15 +80,17 @@ impl Polynomial {
         }
         terms.retain(|_, c| !c.is_zero());
         if terms.len() > max_terms {
-            return Err("Expression is too large; reduce the network first.".into());
+            return Err(TOO_LARGE.into());
         }
         Ok(Self(terms))
     }
+    /// True for zero and for nonzero integer constants.
     fn is_constant(&self) -> bool {
         self.0.keys().all(Vec::is_empty)
     }
-    /// Exact multivariate long division over integer coefficients.
-    /// A failed or oversized division simply leaves the original expression intact.
+    /// Exact multivariate long division over integer coefficients. Returns `None` if
+    /// `divisor` does not divide `self` exactly, or if the work limits are reached; callers
+    /// then keep the original expression intact.
     fn exact_quotient(&self, divisor: &Self) -> Option<Self> {
         let (leading_monomial, leading_coefficient) = divisor.leading_term()?;
         if divisor.is_constant() {
@@ -119,7 +140,7 @@ impl Polynomial {
                 }
             }
             quotient.insert(factor, scale);
-            if remainder.len() > MAX_TERMS * 4 {
+            if remainder.len() > MAX_REMAINDER_TERMS {
                 return None;
             }
         }
@@ -154,6 +175,7 @@ impl Polynomial {
             }
         }))
     }
+    /// Expanded text such as `2*a*b - c`; monomial order follows the map (lexicographic).
     fn text(&self) -> String {
         if self.0.is_empty() {
             return "0".into();
@@ -221,14 +243,25 @@ fn cancellation_factors(expressions: &[&Expression]) -> Vec<Polynomial> {
             .chain([&expression.numerator, &expression.denominator])
         {
             let factor = polynomial.primitive_part();
-            if factor.0.len() > 1 && !factors.contains(&factor) && factors.len() < 64 {
-                factors.push(factor);
-            }
+            push_candidate(&mut factors, factor);
         }
     }
     factors
 }
 
+/// Record a multi-term primitive factor once, up to `MAX_FACTOR_CANDIDATES`. Monomials
+/// and constants are skipped: `Expression::normalized` cancels those directly.
+fn push_candidate(candidates: &mut Vec<Polynomial>, factor: Polynomial) {
+    if factor.0.len() > 1
+        && candidates.len() < MAX_FACTOR_CANDIDATES
+        && !candidates.contains(&factor)
+    {
+        candidates.push(factor);
+    }
+}
+
+/// Divide out each candidate factor from numerator and denominator as many times as it
+/// divides both exactly.
 fn cancel_polynomial_factors(
     mut numerator: Polynomial,
     mut denominator: Polynomial,
@@ -369,6 +402,10 @@ impl Expression {
             cancellation_factors(&[self, other]),
         ))
     }
+    /// Exact zero test; canonical polynomials have no zero terms, so zero is the empty map.
+    pub fn is_zero(&self) -> bool {
+        self.numerator.0.is_empty()
+    }
     /// Render expanded polynomial notation, useful for stable symbol names and diagnostics.
     pub fn text(&self) -> String {
         if self.denominator == Polynomial::constant(1) {
@@ -388,19 +425,35 @@ pub fn compact_solutions(
     matrix: Vec<Vec<Expression>>,
     rhs: Vec<Vec<Expression>>,
     target: usize,
-) -> AlgebraResult<Vec<String>> {
+) -> AlgebraResult<Vec<Solution>> {
     Ok(compact_formulas(matrix, rhs, target)?
-        .iter()
-        .map(Formula::text)
+        .into_iter()
+        .map(|(formula, is_zero)| Solution {
+            text: formula.text(),
+            is_zero,
+        })
         .collect())
 }
 
+/// One solved unknown for one right-hand side, ready for display.
+#[derive(Debug)]
+pub struct Solution {
+    pub text: String,
+    /// The value is exactly zero. Decided on the cancelled exact value, never on the
+    /// rendered text, since a factored presentation need not show its cancellations.
+    pub is_zero: bool,
+}
+
 /// Shares one elimination and one denominator determinant across all right-hand sides.
+/// For each, returns whichever renders shorter: the cancelled expanded ratio, or the
+/// Cramer ratio of Laplace-expanded determinants (which keeps sums like `G_1 + G_2`
+/// grouped). Both are the same value; only the presentation differs. Each formula is
+/// paired with whether its exact value is zero.
 fn compact_formulas(
     matrix: Vec<Vec<Expression>>,
     rhs: Vec<Vec<Expression>>,
     target: usize,
-) -> AlgebraResult<Vec<Formula>> {
+) -> AlgebraResult<Vec<(Formula, bool)>> {
     let values = solve_target(&matrix, &rhs, target)?;
     let denominator: Vec<Vec<_>> = matrix
         .iter()
@@ -411,17 +464,21 @@ fn compact_formulas(
         .iter()
         .zip(&rhs)
         .map(|(value, b)| {
+            if value.is_zero() {
+                return (Formula::atom("0"), true);
+            }
             let compact = Formula::ratio(value.numerator.formula(), value.denominator.formula());
             let mut numerator = denominator.clone();
             for (row, b) in numerator.iter_mut().zip(b) {
                 row[target] = b.numerator.formula();
             }
             let factored = Formula::ratio(determinant(&numerator), denominator_determinant.clone());
-            if factored.text().len() < compact.text().len() {
+            let shorter = if factored.text().len() < compact.text().len() {
                 factored
             } else {
                 compact
-            }
+            };
+            (shorter, false)
         })
         .collect())
 }
@@ -459,16 +516,15 @@ fn solve_target(
                 .collect::<AlgebraResult<Vec<_>>>()
         })
         .collect::<AlgebraResult<Vec<_>>>()?;
+    // Multi-term matrix entries (e.g. `G_1 + G_2` on a diagonal) often divide the result.
     let mut candidates = Vec::new();
     for entry in rows.iter().flat_map(|row| &row[..n]) {
-        let factor = entry.primitive_part();
-        if factor.0.len() > 1 && !candidates.contains(&factor) {
-            candidates.push(factor);
-        }
+        push_candidate(&mut candidates, entry.primitive_part());
     }
-    let too_large = || String::from("Expression is too large; reduce the network first.");
+    let too_large = || String::from(TOO_LARGE);
     let mut previous_pivot = Polynomial::constant(1);
     for k in 0..n {
+        // Any structurally nonzero pivot works: exact arithmetic needs no magnitude pivoting.
         let pivot = (k..n)
             .find(|&i| !rows[i][k].0.is_empty())
             .ok_or("Network has no unique solution. Add a known pressure boundary.")?;
@@ -477,9 +533,10 @@ fn solve_target(
         let pivot_row = &upper[k];
         for row in lower {
             for j in k + 1..row.len() {
+                // Bareiss step: row[j] = (pivot*row[j] - row[k]*pivot_row[j]) / previous_pivot.
                 // The cross product may exceed the cap briefly; the exact division
                 // brings it back to the size of a minor, which must fit.
-                let limit = MAX_TERMS * 8;
+                let limit = MAX_CROSS_PRODUCT_TERMS;
                 let cross = pivot_row[k]
                     .mul_bounded(&row[j], limit)?
                     .add_bounded(&row[k].mul_bounded(&pivot_row[j], limit)?.neg(), limit)?;
@@ -498,11 +555,9 @@ fn solve_target(
         }
         previous_pivot = rows[k][k].clone();
         // Leading minors are the usual source of factors shared by numerator and denominator.
-        let factor = previous_pivot.primitive_part();
-        if factor.0.len() > 1 && !candidates.contains(&factor) {
-            candidates.push(factor);
-        }
+        push_candidate(&mut candidates, previous_pivot.primitive_part());
     }
+    // `n >= 1` here (an empty system has no valid target), so the last row exists.
     let last = rows.pop().unwrap_or_default();
     let (determinant, numerators) = (&last[n - 1], &last[n..]);
     Ok(numerators
@@ -522,9 +577,6 @@ mod tests {
             .collect()
     }
     impl Expression {
-        fn is_zero(&self) -> bool {
-            self.numerator.0.is_empty()
-        }
         fn div(&self, other: &Self) -> AlgebraResult<Self> {
             assert!(!other.is_zero());
             Ok(Self::normalized(
@@ -579,6 +631,22 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn zero_responses_are_flagged_from_the_exact_value() {
+        let g = Expression::symbol("g");
+        let matrix = vec![vec![g.clone()]];
+        let solutions = compact_solutions(
+            matrix,
+            vec![vec![Expression::integer(0)], vec![g.clone()]],
+            0,
+        )
+        .unwrap();
+        assert!(solutions[0].is_zero);
+        assert_eq!(solutions[0].text, "0");
+        assert!(!solutions[1].is_zero);
+        assert_eq!(solutions[1].text, "1");
+    }
+
     #[test]
     fn cancels_repeated_polynomial_factors_exactly() {
         let a = Expression::symbol("a");
@@ -651,7 +719,7 @@ mod tests {
         ];
         let rhs = vec![zero.clone(), zero, kh];
         let exact = solve(matrix.clone(), rhs.clone()).unwrap();
-        let formula = compact_formulas(matrix, vec![rhs], 0).unwrap().remove(0);
+        let formula = compact_formulas(matrix, vec![rhs], 0).unwrap().remove(0).0;
         assert!(formula.text().contains("^2"));
         for parameters in [
             [("K_a", 1.0), ("K_h", 2.0), ("K_t", 3.0), ("K_C", 4.0)],

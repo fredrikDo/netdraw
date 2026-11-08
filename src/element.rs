@@ -5,7 +5,7 @@
 
 use eframe::egui;
 
-// Every completed item on the canvas is stored with its two editable endpoints.
+/// One completed drawing item, stored by its two editable endpoints in canvas coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Element {
     /// Zigzag geometry whose solver label is conductance, despite this legacy name.
@@ -15,14 +15,21 @@ pub enum Element {
 }
 
 impl Element {
+    /// Return `(start, end)` regardless of element kind.
     pub fn endpoints(&self) -> (egui::Pos2, egui::Pos2) {
         match self {
             Self::Resistor(start, end) | Self::PrescribedFlow(start, end) => (*start, *end),
         }
     }
 
+    /// Return one endpoint, selected the same way as in [`DraggedEndpoint`].
+    pub fn endpoint(&self, is_start: bool) -> egui::Pos2 {
+        let (start, end) = self.endpoints();
+        if is_start { start } else { end }
+    }
+
+    /// Move one endpoint; both element kinds share the same editable geometry.
     pub fn move_endpoint(&mut self, is_start: bool, position: egui::Pos2) {
-        // Two-terminal elements share the same editable geometry.
         match self {
             Self::Resistor(start, end) | Self::PrescribedFlow(start, end) => {
                 if is_start {
@@ -34,20 +41,29 @@ impl Element {
         }
     }
 
-    // A prescribed-flow arrow only connects at its tip (the end endpoint).
+    /// A prescribed-flow arrow only connects at its tip (the end endpoint).
     pub fn endpoint_can_snap(&self, is_start: bool) -> bool {
         !matches!(self, Self::PrescribedFlow(_, _) if is_start)
     }
 
+    /// Shift both endpoints, e.g. from canvas to screen coordinates for painting.
     pub fn translated(self, offset: egui::Vec2) -> Self {
         match self {
             Self::Resistor(start, end) => Self::Resistor(start + offset, end + offset),
             Self::PrescribedFlow(start, end) => Self::PrescribedFlow(start + offset, end + offset),
         }
     }
+
+    /// Positions that take part in connectivity: both resistor ends, but only an arrow's tip.
+    fn connection_points(&self) -> impl Iterator<Item = egui::Pos2> {
+        let (start, end) = self.endpoints();
+        let start = matches!(self, Self::Resistor(..)).then_some(start);
+        start.into_iter().chain([end])
+    }
 }
 
-// Selects which kind of element a drag on empty canvas space creates.
+/// Selects which kind of element a drag on empty canvas space creates, or which
+/// non-drawing interaction (select, label, erase) canvas clicks perform.
 #[derive(Clone, Copy, PartialEq)]
 pub enum DrawMode {
     Resistor,
@@ -64,26 +80,34 @@ pub struct DraggedEndpoint {
     pub is_start: bool,
 }
 
-// Handles are drawn at this radius; their larger hit area makes them easier to grab.
+/// Radius at which endpoint handles are drawn; their hit area is larger (see below).
 pub const ENDPOINT_RADIUS: f32 = 8.0;
+/// Shared range for endpoint snapping, hover indicators, and selection.
+pub const ENDPOINT_INTERACTION_DISTANCE: f32 = 16.0;
+/// Pointer distance from an element's centre line that still hits it (erase, label).
+pub const ELEMENT_HIT_DISTANCE: f32 = 10.0;
+/// Elements shorter than this have no drawable symbol, so the canvas does not create them.
+pub const MIN_ELEMENT_LENGTH: f32 = 5.0;
+pub const DIAGRAM_STROKE_WIDTH: f32 = 1.0;
+pub const JUNCTION_NODE_RADIUS: f32 = 2.0;
+pub const RESISTOR_ZIG_SEGMENTS: usize = 7;
 const RESISTOR_BODY_LENGTH: f32 = 60.0;
 const RESISTOR_HALF_WIDTH: f32 = 10.0;
+const PRESCRIBED_FLOW_RADIUS: f32 = 16.0;
 
-// The boundary tick spans exactly the same transverse width as the zigzag,
-// including when a short resistor is scaled down.
+/// Transverse half-width of the zigzag. Short resistors scale down proportionally,
+/// and the boundary tick uses the same width so both always line up.
 pub fn resistor_half_width(length: f32) -> f32 {
     RESISTOR_HALF_WIDTH * (length / RESISTOR_BODY_LENGTH).min(1.0)
 }
-pub const RESISTOR_ZIG_SEGMENTS: usize = 7;
-pub const DIAGRAM_STROKE_WIDTH: f32 = 1.0;
-pub const JUNCTION_NODE_RADIUS: f32 = 2.0;
 
 /// Three zigzag cycles with half-length first/last legs, giving every leg
 /// the same slope. Shared by the canvas, SVG export, and export bounds.
+/// Returns `None` for elements too short to draw.
 pub fn resistor_body(start: egui::Pos2, end: egui::Pos2) -> Option<Vec<egui::Pos2>> {
     let offset = end - start;
     let length = offset.length();
-    if length < 5.0 {
+    if length < MIN_ELEMENT_LENGTH {
         return None;
     }
     let direction = offset / length;
@@ -105,110 +129,137 @@ pub fn resistor_body(start: egui::Pos2, end: egui::Pos2) -> Option<Vec<egui::Pos
     points.push(body_start + direction * body_length);
     Some(points)
 }
-// Shared range for endpoint snapping, hover indicators, and selection.
-pub const ENDPOINT_INTERACTION_DISTANCE: f32 = 16.0;
-const ERASE_DISTANCE: f32 = 10.0;
 
-// Check the most recently drawn elements first, matching their visual stacking order.
-pub fn endpoint_at(elements: &[Element], position: egui::Pos2) -> Option<DraggedEndpoint> {
-    for (element_index, element) in elements.iter().enumerate().rev() {
-        let (start, end) = element.endpoints();
-
-        if position.distance(start) <= ENDPOINT_INTERACTION_DISTANCE {
-            return Some(DraggedEndpoint {
-                element_index,
-                is_start: true,
-            });
-        }
-
-        if position.distance(end) <= ENDPOINT_INTERACTION_DISTANCE {
-            return Some(DraggedEndpoint {
-                element_index,
-                is_start: false,
-            });
-        }
-    }
-
-    None
+/// Geometry of the IEEE-style independent source symbol: lead wires, a centred
+/// circle, and an arrow pointing from `start` toward the connected tip at `end`.
+pub struct PrescribedFlowSymbol {
+    pub leads: [[egui::Pos2; 2]; 2],
+    pub center: egui::Pos2,
+    pub radius: f32,
+    /// Arrow shaft, ending at the arrowhead base so the line does not poke through the tip.
+    pub shaft: [egui::Pos2; 2],
+    /// Filled triangle: tip first, then the two base corners.
+    pub head: [egui::Pos2; 3],
 }
 
-// Returns every endpoint at the selected endpoint's position so joined elements move together.
+/// Shared by the canvas, SVG export, and export bounds. `None` for a zero-length arrow.
+pub fn prescribed_flow_symbol(start: egui::Pos2, end: egui::Pos2) -> Option<PrescribedFlowSymbol> {
+    let offset = end - start;
+    let length = offset.length();
+    if length == 0.0 {
+        return None;
+    }
+    let direction = offset / length;
+    let perpendicular = egui::vec2(-direction.y, direction.x);
+    let center = start + offset * 0.5;
+    let radius = PRESCRIBED_FLOW_RADIUS.min(length / 2.0);
+    // Arrow proportions are fractions of the circle radius so short symbols scale down.
+    let arrow_tip = center + direction * (radius * 0.55);
+    let head_base = arrow_tip - direction * (radius * 0.4);
+    let head_half_width = radius * 0.22;
+    Some(PrescribedFlowSymbol {
+        leads: [
+            [start, center - direction * radius],
+            [center + direction * radius, end],
+        ],
+        center,
+        radius,
+        shaft: [center - direction * (radius * 0.55), head_base],
+        head: [
+            arrow_tip,
+            head_base + perpendicular * head_half_width,
+            head_base - perpendicular * head_half_width,
+        ],
+    })
+}
+
+/// Check the most recently drawn elements first, matching their visual stacking order.
+pub fn endpoint_at(elements: &[Element], position: egui::Pos2) -> Option<DraggedEndpoint> {
+    elements
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(element_index, element)| {
+            [true, false].into_iter().find_map(|is_start| {
+                (position.distance(element.endpoint(is_start)) <= ENDPOINT_INTERACTION_DISTANCE)
+                    .then_some(DraggedEndpoint {
+                        element_index,
+                        is_start,
+                    })
+            })
+        })
+}
+
+/// Every endpoint for which `keep` returns true, in element order, start before end.
+fn endpoints_where(
+    elements: &[Element],
+    keep: impl Fn(egui::Pos2) -> bool,
+) -> Vec<DraggedEndpoint> {
+    elements
+        .iter()
+        .enumerate()
+        .flat_map(|(element_index, element)| {
+            [true, false].map(|is_start| (element_index, is_start, element.endpoint(is_start)))
+        })
+        .filter(|&(_, _, position)| keep(position))
+        .map(|(element_index, is_start, _)| DraggedEndpoint {
+            element_index,
+            is_start,
+        })
+        .collect()
+}
+
+/// Return every endpoint at the selected endpoint's position so joined elements move together.
 pub fn overlapping_endpoints(
     elements: &[Element],
     selected: DraggedEndpoint,
 ) -> Vec<DraggedEndpoint> {
-    let (start, end) = elements[selected.element_index].endpoints();
-    let selected_position = if selected.is_start { start } else { end };
-
-    elements
-        .iter()
-        .enumerate()
-        .flat_map(|(element_index, element)| {
-            let (start, end) = element.endpoints();
-            [(true, start), (false, end)]
-                .into_iter()
-                .filter_map(move |(is_start, endpoint)| {
-                    (endpoint == selected_position).then_some(DraggedEndpoint {
-                        element_index,
-                        is_start,
-                    })
-                })
-        })
-        .collect()
+    let selected_position = elements[selected.element_index].endpoint(selected.is_start);
+    endpoints_where(elements, |position| position == selected_position)
 }
 
 /// Collect editable handles inside a selection rectangle in canvas coordinates.
 pub fn endpoints_in_rect(elements: &[Element], rect: egui::Rect) -> Vec<DraggedEndpoint> {
-    elements
-        .iter()
-        .enumerate()
-        .flat_map(|(element_index, element)| {
-            let (start, end) = element.endpoints();
-            [(true, start), (false, end)]
-                .into_iter()
-                .filter_map(move |(is_start, endpoint)| {
-                    rect.contains(endpoint).then_some(DraggedEndpoint {
-                        element_index,
-                        is_start,
-                    })
-                })
-        })
-        .collect()
+    endpoints_where(elements, |position| rect.contains(position))
 }
 
-// Positions represented by the junction dots on the canvas.
-pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
-    let mut positions = Vec::new();
-
-    for element in elements {
-        if let Element::Resistor(start, end) = element {
-            for position in [*start, *end] {
-                let count = elements
-                    .iter()
-                    .filter_map(|other| match other {
-                        Element::Resistor(other_start, other_end) => {
-                            Some([*other_start, *other_end])
-                        }
-                        _ => None,
-                    })
-                    .flatten()
-                    .filter(|other| *other == position)
-                    .count();
-                if count >= 2 && !positions.contains(&position) {
-                    positions.push(position);
-                }
-            }
-        }
-    }
-
-    for element in elements {
-        if let Element::PrescribedFlow(_, end) = element
-            && !positions.contains(end)
+/// Distinct positions and how many items of `positions` coincide with each, in first-seen
+/// order. Topology uses exact coordinate identity, so a linear scan is the simplest
+/// correct grouping (f32 positions are not `Hash`), and drawings are small.
+fn position_counts(positions: impl Iterator<Item = egui::Pos2>) -> Vec<(egui::Pos2, usize)> {
+    let mut counts: Vec<(egui::Pos2, usize)> = Vec::new();
+    for position in positions {
+        match counts
+            .iter_mut()
+            .find(|(existing, _)| *existing == position)
         {
-            positions.push(*end);
+            Some((_, count)) => *count += 1,
+            None => counts.push((position, 1)),
         }
     }
+    counts
+}
 
+/// Positions drawn with a junction dot: where two or more resistor endpoints meet, and
+/// every arrow tip. These are also the places an internal node label can attach.
+/// The dots are a visual aid only; the solver builds its own graph.
+pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
+    let resistor_ends = elements.iter().flat_map(|element| match *element {
+        Element::Resistor(start, end) => vec![start, end],
+        Element::PrescribedFlow(..) => vec![],
+    });
+    let mut positions: Vec<_> = position_counts(resistor_ends)
+        .into_iter()
+        .filter(|&(_, count)| count >= 2)
+        .map(|(position, _)| position)
+        .collect();
+    for element in elements {
+        if let Element::PrescribedFlow(_, tip) = *element
+            && !positions.contains(&tip)
+        {
+            positions.push(tip);
+        }
+    }
     positions
 }
 
@@ -216,13 +267,7 @@ pub fn junction_positions(elements: &[Element]) -> Vec<egui::Pos2> {
 /// the only places terminal ticks and pressure-boundary labels appear, and the solver
 /// requires a label at each one. Arrow tails are decorative and never connect.
 pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui::Pos2> {
-    let connections: Vec<_> = elements
-        .iter()
-        .flat_map(|element| match *element {
-            Element::Resistor(start, end) => vec![start, end],
-            Element::PrescribedFlow(_, tip) => vec![tip],
-        })
-        .collect();
+    let counts = position_counts(elements.iter().flat_map(Element::connection_points));
     elements
         .iter()
         .filter_map(|element| match *element {
@@ -230,18 +275,37 @@ pub fn unconnected_resistor_terminal_positions(elements: &[Element]) -> Vec<egui
             Element::PrescribedFlow(..) => None,
         })
         .flatten()
-        .filter(|position| {
-            connections
-                .iter()
-                .filter(|other| *other == position)
-                .count()
-                == 1
-        })
+        .filter(|position| counts.contains(&(*position, 1)))
         .collect()
 }
 
-// Returns the closest existing endpoint inside the snap radius, or the original position.
-// `ignored_endpoints` prevents dragged handles from snapping to their old positions.
+/// Line segments marking each free resistor terminal, perpendicular to its resistor and
+/// as wide as the zigzag. Shared by the canvas, SVG export, and export bounds.
+pub fn terminal_ticks(elements: &[Element]) -> Vec<[egui::Pos2; 2]> {
+    let terminals = unconnected_resistor_terminal_positions(elements);
+    let mut ticks = Vec::with_capacity(terminals.len());
+    for element in elements {
+        let Element::Resistor(start, end) = *element else {
+            continue;
+        };
+        let direction = end - start;
+        let length = direction.length();
+        if length == 0.0 {
+            continue;
+        }
+        let half_tick =
+            egui::vec2(-direction.y, direction.x) / length * resistor_half_width(length);
+        for position in [start, end] {
+            if terminals.contains(&position) {
+                ticks.push([position - half_tick, position + half_tick]);
+            }
+        }
+    }
+    ticks
+}
+
+/// Return the closest existing endpoint inside the snap radius, or the original position.
+/// `ignored_endpoints` prevents dragged handles from snapping to their old positions.
 pub fn snap_to_endpoint(
     elements: &[Element],
     position: egui::Pos2,
@@ -250,19 +314,17 @@ pub fn snap_to_endpoint(
     let mut closest = None;
 
     for (element_index, element) in elements.iter().enumerate() {
-        let (start, end) = element.endpoints();
-
-        for (is_start, endpoint) in [(true, start), (false, end)] {
-            if !element.endpoint_can_snap(is_start) {
+        for is_start in [true, false] {
+            if !element.endpoint_can_snap(is_start)
+                || ignored_endpoints.contains(&DraggedEndpoint {
+                    element_index,
+                    is_start,
+                })
+            {
                 continue;
             }
 
-            if ignored_endpoints.iter().any(|ignored| {
-                ignored.element_index == element_index && ignored.is_start == is_start
-            }) {
-                continue;
-            }
-
+            let endpoint = element.endpoint(is_start);
             let distance = position.distance(endpoint);
             if distance <= ENDPOINT_INTERACTION_DISTANCE
                 && closest.is_none_or(|(_, closest_distance)| distance < closest_distance)
@@ -275,7 +337,7 @@ pub fn snap_to_endpoint(
     closest.map_or(position, |(endpoint, _)| endpoint)
 }
 
-// Finds the topmost element close enough to be erased.
+/// Find the topmost element whose centre line passes within [`ELEMENT_HIT_DISTANCE`].
 pub fn element_at(elements: &[Element], position: egui::Pos2) -> Option<usize> {
     elements
         .iter()
@@ -283,11 +345,11 @@ pub fn element_at(elements: &[Element], position: egui::Pos2) -> Option<usize> {
         .rev()
         .find_map(|(index, element)| {
             let (start, end) = element.endpoints();
-            (distance_to_segment(position, start, end) <= ERASE_DISTANCE).then_some(index)
+            (distance_to_segment(position, start, end) <= ELEMENT_HIT_DISTANCE).then_some(index)
         })
 }
 
-// Returns the distance from a point to the closest point on a line segment.
+/// Distance from a point to the closest point on a line segment.
 fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
     let segment = end - start;
     let length_squared = segment.length_sq();
@@ -324,6 +386,31 @@ mod tests {
             }
         }
         assert!(resistor_body(egui::Pos2::ZERO, egui::Pos2::ZERO).is_none());
+    }
+
+    #[test]
+    fn junctions_and_terminals_follow_connectivity() {
+        let shared = egui::pos2(100.0, 0.0);
+        let elements = [
+            Element::Resistor(egui::pos2(0.0, 0.0), shared),
+            Element::Resistor(shared, egui::pos2(200.0, 0.0)),
+            // Arrow tail at a free terminal does not connect it; the tip makes a junction.
+            Element::PrescribedFlow(egui::pos2(0.0, 0.0), egui::pos2(300.0, 50.0)),
+        ];
+
+        assert_eq!(
+            junction_positions(&elements),
+            [shared, egui::pos2(300.0, 50.0)]
+        );
+        assert_eq!(
+            unconnected_resistor_terminal_positions(&elements),
+            [egui::pos2(0.0, 0.0), egui::pos2(200.0, 0.0)]
+        );
+        // Ticks are vertical here and as wide as the full-size zigzag.
+        assert_eq!(
+            terminal_ticks(&elements)[0],
+            [egui::pos2(0.0, -10.0), egui::pos2(0.0, 10.0)]
+        );
     }
 
     #[test]

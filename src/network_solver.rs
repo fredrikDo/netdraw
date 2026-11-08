@@ -1,22 +1,24 @@
-//! Converts drawing topology into equations. All algebra lives in `symbolic`.
+//! Converts drawing topology into nodal equations `A*x = b`. All algebra lives in `symbolic`.
+//!
+//! Terminology: a *node* is a distinct connectable position (see [`Topology`]); a
+//! *boundary* is a node whose value is known from a terminal label; every other node
+//! in the selected connected component is an *unknown*.
+
 use crate::{
     document::Drawing,
     element::{DraggedEndpoint, Element, unconnected_resistor_terminal_positions},
     symbolic::{self, Expression},
 };
 use eframe::egui::Pos2;
-use std::collections::BTreeMap;
-// Count mathematical unknowns, not drawn endpoints or boundaries.
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Count mathematical unknowns, not drawn endpoints or boundaries. This also bounds
+/// the cost of the determinant-based presentation in `symbolic`.
 const MAX_UNKNOWNS: usize = 6;
 
-fn endpoint_position(drawing: &Drawing, endpoint: &DraggedEndpoint) -> Option<Pos2> {
-    drawing.elements.get(endpoint.element_index).map(|e| {
-        let (a, b) = e.endpoints();
-        if endpoint.is_start { a } else { b }
-    })
-}
 /// Trim a literal symbol name; do not interpret label typography. Numeric labels are
 /// rejected because the solver would otherwise confuse a symbol named `0` with zero.
+/// (Words such as `inf` parse as `f64` but contain no digit, so they stay valid symbols.)
 fn required_symbol(label: Option<&String>, description: &str) -> Result<Expression, String> {
     let name = label
         .map(|s| s.trim())
@@ -30,44 +32,65 @@ fn required_symbol(label: Option<&String>, description: &str) -> Result<Expressi
     Ok(Expression::symbol(name))
 }
 
-type Edge = (usize, usize, usize);
+/// One conductance between two nodes. `element` indexes `Drawing::elements`/`labels`.
+#[derive(Clone, Copy, Debug)]
+struct Edge {
+    element: usize,
+    a: usize,
+    b: usize,
+}
+
+/// `(A, b)` of the nodal system, with rows and columns ordered like the unknowns.
 type Equations = (Vec<Vec<Expression>>, Vec<Expression>);
 
-/// Each distinct connectable position is one node; its ID is its index here.
+/// Every node of the solved component paired with its boundary value, or `None` if the
+/// node is unknown.
+type NodeValues = [(usize, Option<Expression>)];
+
+/// Each distinct connectable position is one node; its ID is its index in `positions`.
 struct Topology {
     positions: Vec<Pos2>,
+    /// Free resistor terminals, computed once; each needs a boundary label.
+    terminals: Vec<Pos2>,
 }
+
 impl Topology {
+    /// Arrow tails and unsplit crossings create no nodes.
+    fn new(drawing: &Drawing) -> Self {
+        let mut positions = Vec::new();
+        for element in &drawing.elements {
+            let endpoints = match *element {
+                Element::Resistor(a, b) => vec![a, b],
+                Element::PrescribedFlow(_, tip) => vec![tip],
+            };
+            for position in endpoints {
+                if !positions.contains(&position) {
+                    positions.push(position);
+                }
+            }
+        }
+        Self {
+            positions,
+            terminals: unconnected_resistor_terminal_positions(&drawing.elements),
+        }
+    }
+
     fn node_at(&self, position: Pos2) -> Option<usize> {
         self.positions.iter().position(|p| *p == position)
     }
 }
-/// Arrow tails and unsplit crossings create no nodes.
-fn drawing_topology(drawing: &Drawing) -> Topology {
-    let mut positions = Vec::new();
-    for e in &drawing.elements {
-        let endpoints = match *e {
-            Element::Resistor(a, b) => vec![a, b],
-            Element::PrescribedFlow(_, tip) => vec![tip],
-        };
-        for p in endpoints {
-            if !positions.contains(&p) {
-                positions.push(p);
-            }
-        }
-    }
-    Topology { positions }
-}
+
 /// Restrict solving and validation to conductances reachable from the selection.
+/// Repeats a linear pass until no node is added; fine for drawings of this size.
 fn connected_component(target: usize, edges: &[Edge]) -> Vec<usize> {
     let mut component = vec![target];
     loop {
         let before = component.len();
-        for (_, a, b) in edges {
-            if component.contains(a) || component.contains(b) {
-                for n in [a, b] {
-                    if !component.contains(n) {
-                        component.push(*n);
+        for edge in edges {
+            if component.contains(&edge.a) || component.contains(&edge.b) {
+                for node in [edge.a, edge.b] {
+                    if !component.contains(&node) {
+                        component.push(node);
                     }
                 }
             }
@@ -78,6 +101,7 @@ fn connected_component(target: usize, edges: &[Edge]) -> Vec<usize> {
     }
     component
 }
+
 /// Read known terminal values and reject conflicting or missing boundary labels.
 /// Free terminals are exactly the positions the canvas marks with a terminal tick;
 /// empty labels (e.g. a cancelled label edit) count as absent.
@@ -89,30 +113,28 @@ fn boundary_pressure(
     let labels: Vec<_> = drawing
         .terminal_labels
         .iter()
-        .filter(|l| topology.node_at(l.position) == Some(node) && !l.text.trim().is_empty())
+        .map(|label| label.text.trim())
+        .zip(&drawing.terminal_labels)
+        .filter(|(text, label)| !text.is_empty() && topology.node_at(label.position) == Some(node))
+        .map(|(text, _)| text)
         .collect();
-    if labels.len() > 1
-        && labels
-            .iter()
-            .any(|l| l.text.trim() != labels[0].text.trim())
-    {
+    if labels.iter().any(|text| *text != labels[0]) {
         return Err("Connected pressure boundaries have conflicting labels.".into());
     }
-    if let Some(label) = labels.first() {
-        return required_symbol(Some(&label.text), "the pressure boundary").map(Some);
+    if let Some(text) = labels.first() {
+        return required_symbol(Some(&text.to_string()), "the pressure boundary").map(Some);
     }
     let position = topology.positions[node];
-    if unconnected_resistor_terminal_positions(&drawing.elements).contains(&position) {
-        let conductance = drawing
-            .elements
-            .iter()
-            .zip(&drawing.labels)
-            .find_map(|(e, label)| match *e {
+    if topology.terminals.contains(&position) {
+        // Name the attached conductance, if labeled, to help the user find the terminal.
+        let conductance = drawing.elements.iter().zip(&drawing.labels).find_map(
+            |(element, label)| match *element {
                 Element::Resistor(a, b) if a == position || b == position => {
                     Some(label.trim()).filter(|l| !l.is_empty())
                 }
                 _ => None,
-            });
+            },
+        );
         return Err(match conductance {
             Some(name) => {
                 format!("Label the free terminal of conductance {name} with its known pressure.")
@@ -125,73 +147,105 @@ fn boundary_pressure(
     Ok(None)
 }
 
-/// Assemble the physical system using literal prescribed-flux symbols.
+/// Assemble the physical system using literal boundary and prescribed-flux symbols.
 fn build_equations(
     drawing: &Drawing,
     topology: &Topology,
     edges: &[Edge],
-    known: &[(usize, Option<Expression>)],
+    values: &NodeValues,
     unknown: &[usize],
 ) -> Result<Equations, String> {
-    build_equations_with_sources(drawing, topology, edges, known, unknown, |i| {
+    let matrix = conductance_matrix(drawing, edges, unknown)?;
+    let rhs = right_hand_side(drawing, topology, edges, values, unknown, |i| {
         required_symbol(drawing.labels.get(i), "each prescribed flow")
-    })
-}
-
-/// Assemble `A*x = b`; the callback substitutes physical fluxes or unit sources.
-/// Known boundary terms enter `b`; conductances enter `A` independently of flux.
-fn build_equations_with_sources(
-    drawing: &Drawing,
-    topology: &Topology,
-    edges: &[Edge],
-    known: &[(usize, Option<Expression>)],
-    unknown: &[usize],
-    source: impl Fn(usize) -> Result<Expression, String>,
-) -> Result<Equations, String> {
-    let mut matrix = vec![vec![Expression::integer(0); unknown.len()]; unknown.len()];
-    let mut rhs = vec![Expression::integer(0); unknown.len()];
-    for (row, &node) in unknown.iter().enumerate() {
-        for (i, a, b) in edges {
-            if a == b || (*a != node && *b != node) {
-                continue;
-            }
-            let neighbor = if *a == node { *b } else { *a };
-            let conductance = required_symbol(drawing.labels.get(*i), "each conductance")?;
-            // G*(p_i - p_j): the self coefficient is positive, the neighbor negative.
-            matrix[row][row] = matrix[row][row].add(&conductance)?;
-            if let Some(col) = unknown.iter().position(|n| *n == neighbor) {
-                matrix[row][col] = matrix[row][col].sub(&conductance)?;
-            } else if let Some((_, Some(p))) = known.iter().find(|(n, _)| *n == neighbor) {
-                rhs[row] = rhs[row].add(&conductance.mul(p)?)?;
-            }
-        }
-        for (i, e) in drawing.elements.iter().enumerate() {
-            if let Element::PrescribedFlow(_, p) = e {
-                if topology.node_at(*p) == Some(node) {
-                    // A prescribed flux never multiplies a node value or enters the matrix.
-                    rhs[row] = rhs[row].add(&source(i)?)?;
-                }
-            }
-        }
-    }
+    })?;
     Ok((matrix, rhs))
 }
 
+/// Edges incident to `node`, yielding the conductance's element index and the other end.
+/// Self-loops carry no potential difference and are skipped.
+fn incident_edges(edges: &[Edge], node: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    edges.iter().filter_map(move |edge| {
+        if edge.a == edge.b {
+            None
+        } else if edge.a == node {
+            Some((edge.element, edge.b))
+        } else if edge.b == node {
+            Some((edge.element, edge.a))
+        } else {
+            None
+        }
+    })
+}
+
+/// Coefficient matrix `A` from `sum_j G_ij*(p_i - p_j)`: each conductance adds to the
+/// diagonal and subtracts from the column of an unknown neighbour. It depends only on
+/// conductances, so every right-hand side of one network shares it.
+fn conductance_matrix(
+    drawing: &Drawing,
+    edges: &[Edge],
+    unknown: &[usize],
+) -> Result<Vec<Vec<Expression>>, String> {
+    let mut matrix = vec![vec![Expression::integer(0); unknown.len()]; unknown.len()];
+    for (row, &node) in unknown.iter().enumerate() {
+        for (element, neighbor) in incident_edges(edges, node) {
+            let conductance = required_symbol(drawing.labels.get(element), "each conductance")?;
+            matrix[row][row] = matrix[row][row].add(&conductance)?;
+            if let Some(col) = unknown.iter().position(|n| *n == neighbor) {
+                matrix[row][col] = matrix[row][col].sub(&conductance)?;
+            }
+        }
+    }
+    Ok(matrix)
+}
+
+/// Right-hand side `b`: `G*p_j` for each conductance to a known neighbour, plus the
+/// prescribed inflows at the node. `source` maps a flow's element index to its value,
+/// so the same assembly serves physical fluxes and unit responses.
+fn right_hand_side(
+    drawing: &Drawing,
+    topology: &Topology,
+    edges: &[Edge],
+    values: &NodeValues,
+    unknown: &[usize],
+    source: impl Fn(usize) -> Result<Expression, String>,
+) -> Result<Vec<Expression>, String> {
+    let mut rhs = vec![Expression::integer(0); unknown.len()];
+    for (row, &node) in unknown.iter().enumerate() {
+        for (element, neighbor) in incident_edges(edges, node) {
+            if let Some((_, Some(value))) = values.iter().find(|(n, _)| *n == neighbor) {
+                let conductance = required_symbol(drawing.labels.get(element), "each conductance")?;
+                rhs[row] = rhs[row].add(&conductance.mul(value)?)?;
+            }
+        }
+        for (i, element) in drawing.elements.iter().enumerate() {
+            // A prescribed flux never multiplies a node value or enters the matrix.
+            if let Element::PrescribedFlow(_, tip) = element
+                && topology.node_at(*tip) == Some(node)
+            {
+                rhs[row] = rhs[row].add(&source(i)?)?;
+            }
+        }
+    }
+    Ok(rhs)
+}
+
 /// Pick a repeated boundary value as the reference, then solve independent unit
-/// responses. Boundary differences and prescribed fluxes remain outside the algebra.
+/// responses. Boundary differences and prescribed fluxes remain outside the algebra,
+/// giving `p = ref + sum_k c_k*(P_k - ref) + sum_q c_q*Q`. Returns `None` when no
+/// boundary value repeats, in which case the caller solves the physical system directly.
 fn reference_solution(
     drawing: &Drawing,
     topology: &Topology,
     edges: &[Edge],
-    known: &[(usize, Option<Expression>)],
+    values: &NodeValues,
     unknown: &[usize],
     target: usize,
 ) -> Result<Option<String>, String> {
+    // BTreeMap/BTreeSet keep the reference choice and term order deterministic.
     let mut counts = BTreeMap::<String, usize>::new();
-    for (_, pressure) in known {
-        if let Some(pressure) = pressure {
-            *counts.entry(pressure.text()).or_default() += 1;
-        }
+    for value in values.iter().filter_map(|(_, value)| value.as_ref()) {
+        *counts.entry(value.text()).or_default() += 1;
     }
     let Some((reference, _)) = counts
         .iter()
@@ -201,32 +255,32 @@ fn reference_solution(
         return Ok(None);
     };
     // The matrix is the same for every unit response; only the right-hand side changes,
-    // so collect them all and solve them in a single elimination.
-    let mut matrix = Vec::new();
+    // so build it once and solve all right-hand sides in a single elimination.
+    let matrix = conductance_matrix(drawing, edges, unknown)?;
     let mut responses = Vec::new();
     let mut multipliers = Vec::new();
     for boundary in counts.keys().filter(|name| *name != reference) {
-        let unit_boundaries = unit_boundary_values(known, Some(boundary));
-        let (a, rhs) = build_equations_with_sources(
+        let unit_boundaries = unit_boundary_values(values, Some(boundary));
+        responses.push(right_hand_side(
             drawing,
             topology,
             edges,
             &unit_boundaries,
             unknown,
             |_| Ok(Expression::integer(0)),
-        )?;
-        matrix = a;
-        responses.push(rhs);
+        )?);
         multipliers.push(format!("({boundary} - {reference})"));
     }
-    let flow_names: std::collections::BTreeSet<_> = drawing
+    // Fluxes injected at boundaries do not affect unknown values, so only collect
+    // flows into unknown nodes. Flows sharing one label form a single response.
+    let flow_names: BTreeSet<_> = drawing
         .elements
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| match e {
-            Element::PrescribedFlow(_, position)
+        .filter_map(|(i, element)| match element {
+            Element::PrescribedFlow(_, tip)
                 if topology
-                    .node_at(*position)
+                    .node_at(*tip)
                     .is_some_and(|node| unknown.contains(&node)) =>
             {
                 Some(drawing.labels[i].trim().to_string())
@@ -234,9 +288,9 @@ fn reference_solution(
             _ => None,
         })
         .collect();
+    let zero_boundaries = unit_boundary_values(values, None);
     for flow in flow_names {
-        let zero_boundaries = unit_boundary_values(known, None);
-        let (a, rhs) = build_equations_with_sources(
+        responses.push(right_hand_side(
             drawing,
             topology,
             edges,
@@ -247,34 +301,34 @@ fn reference_solution(
                     drawing.labels[i].trim() == flow,
                 )))
             },
-        )?;
-        matrix = a;
-        responses.push(rhs);
+        )?);
         multipliers.push(flow);
     }
     let mut terms = vec![reference.clone()];
     if !responses.is_empty() {
         let coefficients = symbolic::compact_solutions(matrix, responses, target)?;
         for (coefficient, multiplier) in coefficients.iter().zip(multipliers) {
-            if coefficient != "0" {
-                terms.push(format!("({coefficient})*{multiplier}"));
+            // A boundary or flux with no influence on the target is omitted.
+            if !coefficient.is_zero {
+                terms.push(format!("({})*{multiplier}", coefficient.text));
             }
         }
     }
     Ok(Some(terms.join(" + ")))
 }
 
-/// Preserve unknown nodes and replace known values by a selected unit excitation.
+/// Preserve unknown nodes and replace known values by a selected unit excitation:
+/// boundaries labelled `active` become 1, all others 0.
 fn unit_boundary_values(
-    known: &[(usize, Option<Expression>)],
+    values: &NodeValues,
     active: Option<&str>,
 ) -> Vec<(usize, Option<Expression>)> {
-    known
+    values
         .iter()
-        .map(|(node, pressure)| {
+        .map(|(node, value)| {
             (
                 *node,
-                pressure.as_ref().map(|value| {
+                value.as_ref().map(|value| {
                     Expression::integer(i32::from(active == Some(value.text().as_str())))
                 }),
             )
@@ -285,16 +339,17 @@ fn unit_boundary_values(
 /// Validate and solve one selected mathematical node without mutating the drawing.
 /// Returns a display expression or a diagnostic suitable for the result dialog.
 pub fn solve_selected(drawing: &Drawing, selection: &[DraggedEndpoint]) -> Result<String, String> {
-    let topology = drawing_topology(drawing);
+    let topology = Topology::new(drawing);
     let node_at = |p| topology.node_at(p);
+    // Map each selected handle to its node; arrow tails map to `None` (they never connect).
     let selected: Vec<_> = selection
         .iter()
-        .map(|e| {
+        .map(|endpoint| {
             drawing
                 .elements
-                .get(e.element_index)
-                .filter(|element| element.endpoint_can_snap(e.is_start))
-                .and_then(|_| endpoint_position(drawing, e))
+                .get(endpoint.element_index)
+                .filter(|element| element.endpoint_can_snap(endpoint.is_start))
+                .map(|element| element.endpoint(endpoint.is_start))
                 .and_then(node_at)
         })
         .collect();
@@ -310,30 +365,36 @@ pub fn solve_selected(drawing: &Drawing, selection: &[DraggedEndpoint]) -> Resul
         .elements
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| match e {
-            Element::Resistor(a, b) => Some((i, node_at(*a).unwrap(), node_at(*b).unwrap())),
-            _ => None,
+        .filter_map(|(element, e)| match *e {
+            // Topology contains every resistor endpoint, so both lookups succeed.
+            Element::Resistor(a, b) => Some(Edge {
+                element,
+                a: node_at(a).unwrap(),
+                b: node_at(b).unwrap(),
+            }),
+            Element::PrescribedFlow(..) => None,
         })
         .collect();
     let component = connected_component(target, &edges);
-    let known: Vec<_> = component
+    let values: Vec<_> = component
         .iter()
         .map(|&n| boundary_pressure(drawing, &topology, n).map(|p| (n, p)))
         .collect::<Result<_, _>>()?;
-    if !known.iter().any(|(_, p)| p.is_some()) {
+    if !values.iter().any(|(_, p)| p.is_some()) {
         return Err("Network needs at least one labeled pressure boundary.".into());
     }
-    // Validate every resistor and flow in this connected component, including known nodes.
-    for (i, a, _) in &edges {
-        if component.contains(a) {
-            required_symbol(drawing.labels.get(*i), "each conductance")?;
+    // Validate every resistor and flow in this connected component, including known nodes,
+    // so a missing label is reported even if it would not affect the target.
+    for edge in &edges {
+        if component.contains(&edge.a) {
+            required_symbol(drawing.labels.get(edge.element), "each conductance")?;
         }
     }
-    for (i, e) in drawing.elements.iter().enumerate() {
-        if let Element::PrescribedFlow(_, p) = e {
-            if node_at(*p).is_some_and(|n| component.contains(&n)) {
-                required_symbol(drawing.labels.get(i), "each prescribed flow")?;
-            }
+    for (i, element) in drawing.elements.iter().enumerate() {
+        if let Element::PrescribedFlow(_, tip) = element
+            && node_at(*tip).is_some_and(|n| component.contains(&n))
+        {
+            required_symbol(drawing.labels.get(i), "each prescribed flow")?;
         }
     }
     let target_name = drawing
@@ -344,10 +405,10 @@ pub fn solve_selected(drawing: &Drawing, selection: &[DraggedEndpoint]) -> Resul
         .find(|(position, text)| node_at(*position) == Some(target) && !text.is_empty())
         .map(|(_, text)| text.to_string())
         .unwrap_or_else(|| "p_selected".into());
-    if let Some((_, Some(value))) = known.iter().find(|(n, _)| *n == target) {
+    if let Some((_, Some(value))) = values.iter().find(|(n, _)| *n == target) {
         return Ok(format!("{target_name} = {}", value.text()));
     }
-    let unknown: Vec<_> = known
+    let unknown: Vec<_> = values
         .iter()
         .filter(|(_, p)| p.is_none())
         .map(|(n, _)| *n)
@@ -358,15 +419,16 @@ pub fn solve_selected(drawing: &Drawing, selection: &[DraggedEndpoint]) -> Resul
             unknown.len()
         ));
     }
+    // The target is in the component and has no boundary value, so it is unknown.
     let target_index = unknown.iter().position(|n| *n == target).unwrap();
     if let Some(expression) =
-        reference_solution(drawing, &topology, &edges, &known, &unknown, target_index)?
+        reference_solution(drawing, &topology, &edges, &values, &unknown, target_index)?
     {
         return Ok(format!("{target_name} = {expression}"));
     }
-    let (matrix, rhs) = build_equations(drawing, &topology, &edges, &known, &unknown)?;
+    let (matrix, rhs) = build_equations(drawing, &topology, &edges, &values, &unknown)?;
     let mut solutions = symbolic::compact_solutions(matrix, vec![rhs], target_index)?;
-    Ok(format!("{target_name} = {}", solutions.remove(0)))
+    Ok(format!("{target_name} = {}", solutions.remove(0).text))
 }
 
 #[cfg(test)]
@@ -492,15 +554,25 @@ mod tests {
             position: p(0.0),
             text: "P_boundary".into(),
         }];
-        let topology = drawing_topology(&drawing);
+        let topology = Topology::new(&drawing);
         let boundary = topology.node_at(p(0.0)).unwrap();
         let node = topology.node_at(p(1.0)).unwrap();
         let known = vec![
             (boundary, Some(Expression::symbol("P_boundary"))),
             (node, None),
         ];
-        let (matrix, rhs) =
-            build_equations(&drawing, &topology, &[(0, boundary, node)], &known, &[node]).unwrap();
+        let (matrix, rhs) = build_equations(
+            &drawing,
+            &topology,
+            &[Edge {
+                element: 0,
+                a: boundary,
+                b: node,
+            }],
+            &known,
+            &[node],
+        )
+        .unwrap();
         // G * p = G * P_boundary + Q: Q never enters the node coefficient.
         assert_eq!(matrix[0][0].text(), "G");
         assert_eq!(rhs[0].text(), "G*P_boundary + Q");

@@ -1,7 +1,10 @@
 //! Factored expression trees used only for presentation; exact arithmetic stays in symbolic.rs.
+
 /// Presentation-only tree: preserves grouping without changing exact arithmetic.
+/// Construct through the smart constructors (`sum`, `product`, ...), which simplify
+/// trivial cases; the literal atoms `"0"` and `"1"` act as zero and one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Formula {
+pub enum Formula {
     Atom(String),
     Sum(Vec<Formula>),
     Product(Vec<Formula>),
@@ -10,12 +13,15 @@ pub(crate) enum Formula {
     Ratio(Box<Formula>, Box<Formula>),
 }
 impl Formula {
+    /// A symbol name or an integer literal.
     pub fn atom(value: impl Into<String>) -> Self {
         Self::Atom(value.into())
     }
+    /// Structural zero test; only the literal atom `0` counts.
     pub fn is_zero(&self) -> bool {
         *self == Self::atom("0")
     }
+    /// Negate, cancelling double negation and leaving zero unsigned.
     pub fn negative(self) -> Self {
         match self {
             Self::Negative(value) => *value,
@@ -114,6 +120,7 @@ impl Formula {
             Self::Atom(_) => 5,
         }
     }
+    /// Text of `self` as an operand of an operator with the given precedence.
     fn nested(&self, precedence: u8) -> String {
         let text = self.text();
         if self.precedence() < precedence {
@@ -151,8 +158,10 @@ impl Formula {
     }
 }
 
-/// Sparse Laplace expansion preserves sums/products from the nodal matrix.
-pub(crate) fn determinant(matrix: &[Vec<Formula>]) -> Formula {
+/// Sparse Laplace expansion preserves sums/products from the nodal matrix. It expands
+/// along the row with the fewest nonzero entries; the cost is factorial in the worst
+/// case, which the solver's six-unknown limit keeps small.
+pub fn determinant(matrix: &[Vec<Formula>]) -> Formula {
     let n = matrix.len();
     if n == 0 {
         return Formula::atom("1");
