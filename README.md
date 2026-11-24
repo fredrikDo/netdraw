@@ -27,7 +27,23 @@ It can model steady linear heat, pressure, or similar potential-and-flux network
 - Export finished diagrams as SVG with embedded fonts
 - Protect unsaved work when opening, creating, or closing drawings
 
-## Getting started
+## Download
+
+Ready-to-run builds for Windows, macOS (Apple Silicon and Intel), and Linux are available on the
+[Releases page](https://github.com/fredrikDo/netdraw/releases). No installation of Rust or other
+tools is needed.
+
+- **Windows:** unzip and run `netdraw.exe`. If SmartScreen warns that the app is unrecognized,
+  choose **More info → Run anyway**.
+- **macOS:** unzip and move `NetDraw.app` to Applications. The first time, right-click the app and
+  choose **Open**.
+- **Linux:** extract the archive and run `./netdraw`. See [Application icon](#application-icon) to add
+  NetDraw to your application menu.
+
+Pre-release builds are marked as such on the Releases page. See each release's notes for details and
+known limitations.
+
+## Building from source
 
 NetDraw is written in Rust. Install a current Rust toolchain, clone the repository, and run:
 
