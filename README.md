@@ -126,7 +126,18 @@ The result is a snapshot; click Solve again after editing the drawing.
 
 The application uses the blue resistor icon in `assets/icons/netdraw.svg`. The window icon is embedded on all platforms, and Windows builds also embed `assets/icons/netdraw.ico` into the executable (using the Windows SDK resource compiler or MinGW `windres`).
 
-Linux desktop launchers, including Wayland desktops, use the supplied desktop entry and installed icon. After `cargo build --release`, install them for your user with:
+Linux desktop launchers, including Wayland desktops, use the supplied desktop entry and installed icon.
+
+If you downloaded a release, run these commands from inside the extracted folder to install for your user:
+
+```sh
+install -Dm755 netdraw ~/.local/bin/netdraw
+install -Dm644 netdraw.svg ~/.local/share/icons/hicolor/scalable/apps/netdraw.svg
+install -Dm644 netdraw.png ~/.local/share/icons/hicolor/256x256/apps/netdraw.png
+install -Dm644 netdraw.desktop ~/.local/share/applications/netdraw.desktop
+```
+
+If you built from source, run these from the repository root after `cargo build --release`:
 
 ```sh
 install -Dm755 target/release/netdraw ~/.local/bin/netdraw
