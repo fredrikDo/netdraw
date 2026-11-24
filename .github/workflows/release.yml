@@ -1,0 +1,142 @@
+# Builds NetDraw for Linux, Windows and macOS when a version tag is pushed
+# (for example `v0.1.0-beta.1`) and publishes the binaries as a GitHub release.
+# Tags containing a hyphen (`-beta.1`, `-rc.1`) are marked as pre-releases.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            # Oldest supported runner, so the binary works on distros with an older glibc.
+            os: ubuntu-22.04
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos-universal
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev
+
+      - name: Run tests
+        run: cargo test --locked --release
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release
+          dir="netdraw-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/netdraw packaging/linux/netdraw.desktop \
+             assets/icons/netdraw.svg assets/icons/netdraw.png LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --release
+          $dir = "netdraw-$env:GITHUB_REF_NAME-${{ matrix.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/netdraw.exe, LICENSE, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          app="NetDraw.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Resources"
+          lipo -create -output "$app/MacOS/netdraw" \
+            target/aarch64-apple-darwin/release/netdraw \
+            target/x86_64-apple-darwin/release/netdraw
+
+          # Build the .icns icon from the PNG.
+          mkdir netdraw.iconset
+          for size in 16 32 128 256; do
+            sips -z $size $size assets/icons/netdraw.png --out netdraw.iconset/icon_${size}x${size}.png
+            double=$((size * 2))
+            sips -z $double $double assets/icons/netdraw.png --out netdraw.iconset/icon_${size}x${size}@2x.png
+          done
+          iconutil -c icns netdraw.iconset -o "$app/Resources/netdraw.icns"
+
+          version="${GITHUB_REF_NAME#v}"
+          cat > "$app/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>NetDraw</string>
+            <key>CFBundleDisplayName</key><string>NetDraw</string>
+            <key>CFBundleIdentifier</key><string>io.github.fredrikdo.netdraw</string>
+            <key>CFBundleExecutable</key><string>netdraw</string>
+            <key>CFBundleIconFile</key><string>netdraw.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict>
+          </plist>
+          EOF
+
+          # Ad-hoc signature; required for arm64 binaries to launch at all.
+          codesign --force --deep --sign - NetDraw.app
+          ditto -c -k --keepParent NetDraw.app "netdraw-${GITHUB_REF_NAME}-${{ matrix.name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NetDraw ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            *.zip
